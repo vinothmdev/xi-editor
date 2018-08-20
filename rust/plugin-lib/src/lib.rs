@@ -27,6 +27,9 @@ extern crate rand;
 extern crate memchr;
 extern crate languageserver_types;
 
+#[macro_use]
+extern crate log;
+
 mod state_cache;
 mod base_cache;
 mod view;

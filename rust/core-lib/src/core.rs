@@ -40,6 +40,7 @@ pub enum XiCore {
     Running(Arc<Mutex<CoreState>>),
 }
 
+
 /// A weak reference to the main state. This is passed to plugin threads.
 #[derive(Clone)]
 pub struct WeakXiCore(Weak<Mutex<CoreState>>);
@@ -95,7 +96,7 @@ impl Handler for XiCore {
                 true => xi_trace::enable_tracing(),
                 false => xi_trace::disable_tracing(),
             }
-            eprintln!("tracing in core = {:?}", enabled);
+            info!("tracing in core = {:?}", enabled);
             if self.is_waiting() {
                 return;
             }

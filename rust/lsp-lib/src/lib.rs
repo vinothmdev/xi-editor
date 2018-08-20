@@ -15,6 +15,11 @@
 extern crate serde_derive;
 extern crate serde_json;
 
+#[macro_use]
+extern crate log;
+extern crate fern;
+extern crate chrono;
+
 extern crate jsonrpc_lite;
 extern crate languageserver_types as lsp_types;
 extern crate serde;
@@ -39,6 +44,5 @@ pub use lsp_plugin::LspPlugin;
 pub use types::Config;
 
 pub fn start_mainloop<P: Plugin>(plugin: &mut P) {
-    // Unwrap to indicate that we want thread to Panic on failure
     mainloop(plugin).unwrap();
 }
