@@ -15,14 +15,14 @@
 //! Very basic syntax detection.
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
 use config::Table;
 
 /// The canonical identifier for a particular `LanguageDefinition`.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LanguageId(Arc<String>);
 
 /// Describes a `LanguageDefinition`. Although these are provided by plugins,
@@ -41,18 +41,19 @@ pub struct LanguageDefinition {
 /// A repository of all loaded `LanguageDefinition`s.
 #[derive(Debug, Default)]
 pub struct Languages {
-    named: HashMap<LanguageId, Arc<LanguageDefinition>>,
+    // NOTE: BTreeMap is used for sorting the languages by name alphabetically
+    named: BTreeMap<LanguageId, Arc<LanguageDefinition>>,
     extensions: HashMap<String, Arc<LanguageDefinition>>,
 }
 
 impl Languages {
     pub fn new(language_defs: &[LanguageDefinition]) -> Self {
-        let mut named = HashMap::new();
+        let mut named = BTreeMap::new();
         let mut extensions = HashMap::new();
         for lang in language_defs.iter() {
             let lang_arc = Arc::new(lang.clone());
             named.insert(lang.name.clone(), lang_arc.clone());
-            for ext in lang.extensions.iter() {
+            for ext in &lang.extensions {
                 extensions.insert(ext.clone(), lang_arc.clone());
             }
         }
@@ -66,7 +67,8 @@ impl Languages {
     }
 
     pub fn language_for_name<S>(&self, name: S) -> Option<Arc<LanguageDefinition>>
-        where S: AsRef<str>
+    where
+        S: AsRef<str>,
     {
         self.named.get(name.as_ref()).map(Arc::clone)
     }
@@ -74,13 +76,14 @@ impl Languages {
     /// Returns a Vec of any `LanguageDefinition`s which exist
     /// in `self` but not `other`.
     pub fn difference(&self, other: &Languages) -> Vec<Arc<LanguageDefinition>> {
-        self.named.iter()
+        self.named
+            .iter()
             .filter(|(k, _)| !other.named.contains_key(*k))
             .map(|(_, v)| v.clone())
             .collect()
     }
 
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item=&'a Arc<LanguageDefinition>> {
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<LanguageDefinition>> {
         self.named.values()
     }
 }
@@ -107,9 +110,7 @@ impl<'a> From<&'a str> for LanguageId {
 // for testing
 #[cfg(test)]
 impl LanguageDefinition {
-    pub(crate) fn simple(name: &str, exts: &[&str],
-                         scope: &str, config: Option<Table>) -> Self
-    {
+    pub(crate) fn simple(name: &str, exts: &[&str], scope: &str, config: Option<Table>) -> Self {
         LanguageDefinition {
             name: name.into(),
             extensions: exts.iter().map(|s| (*s).into()).collect(),

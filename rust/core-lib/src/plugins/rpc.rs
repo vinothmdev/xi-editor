@@ -14,19 +14,19 @@
 
 //! RPC types, corresponding to protocol requests, notifications & responses.
 
-use std::path::PathBuf;
 use std::borrow::Borrow;
+use std::path::PathBuf;
 
 use serde::de::{self, Deserialize, Deserializer};
 use serde::ser::{self, Serialize, Serializer};
 use serde_json::{self, Value};
 
-use xi_rope::rope::{RopeDelta, Rope, LinesMetric};
-use xi_rpc::RemoteError;
 use super::PluginPid;
+use config::Table;
 use syntax::LanguageId;
 use tabs::{BufferIdentifier, ViewId};
-use config::Table;
+use xi_rope::{LinesMetric, Rope, RopeDelta};
+use xi_rpc::RemoteError;
 
 //TODO: At the moment (May 08, 2017) this is all very much in flux.
 // At some point, it will be stabalized and then perhaps will live in another crate,
@@ -111,9 +111,10 @@ pub enum HostNotification {
     DidClose { view_id: ViewId },
     GetHover { view_id: ViewId, request_id: usize, position: usize },
     Shutdown(EmptyStruct),
-    TracingConfig {enabled: bool},
+    TracingConfig { enabled: bool },
+    LanguageChanged { view_id: ViewId, new_lang: LanguageId },
+    CustomCommand { view_id: ViewId, method: String, params: Value },
 }
-
 
 // ====================================================================
 // plugin -> core RPC method types
@@ -173,7 +174,6 @@ pub enum PluginRequest {
     GetSelections,
 }
 
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
@@ -184,7 +184,7 @@ pub enum PluginNotification {
     Edit { edit: PluginEdit },
     Alert { msg: String },
     AddStatusItem { key: String, value: String, alignment: String },
-    UpdateStatusItem { key: String, value: String  },
+    UpdateStatusItem { key: String, value: String },
     RemoveStatusItem { key: String },
     ShowHover { request_id: usize, result: Result<Hover, RemoteError> },
 }
@@ -203,7 +203,7 @@ pub struct Range {
 #[serde(rename_all = "snake_case")]
 pub struct Hover {
     pub content: String,
-    pub range: Option<Range>
+    pub range: Option<Range>,
 }
 
 /// Common wrapper for plugin-originating RPCs.
@@ -213,10 +213,10 @@ pub struct PluginCommand<T> {
     pub cmd: T,
 }
 
-impl<T: Serialize> Serialize for PluginCommand<T>
-{
+impl<T: Serialize> Serialize for PluginCommand<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where S: Serializer
+    where
+        S: Serializer,
     {
         let mut v = serde_json::to_value(&self.cmd).map_err(ser::Error::custom)?;
         v["params"]["view_id"] = json!(self.view_id);
@@ -225,10 +225,10 @@ impl<T: Serialize> Serialize for PluginCommand<T>
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for PluginCommand<T>
-{
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for PluginCommand<T> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where D: Deserializer<'de>
+    where
+        D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
         struct InnerIds {
@@ -249,22 +249,36 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for PluginCommand<T>
 }
 
 impl PluginBufferInfo {
-    pub fn new(buffer_id: BufferIdentifier, views: &[ViewId],
-               rev: u64, buf_size: usize, nb_lines: usize,
-               path: Option<PathBuf>, syntax: LanguageId,
-               config: Table) -> Self {
+    pub fn new(
+        buffer_id: BufferIdentifier,
+        views: &[ViewId],
+        rev: u64,
+        buf_size: usize,
+        nb_lines: usize,
+        path: Option<PathBuf>,
+        syntax: LanguageId,
+        config: Table,
+    ) -> Self {
         //TODO: do make any current assertions about paths being valid utf-8? do we want to?
         let path = path.map(|p| p.to_str().unwrap().to_owned());
         let views = views.to_owned();
-        PluginBufferInfo { buffer_id, views, rev, buf_size,
-        nb_lines, path, syntax, config }
+        PluginBufferInfo { buffer_id, views, rev, buf_size, nb_lines, path, syntax, config }
     }
 }
 
 impl PluginUpdate {
-    pub fn new<D>(view_id: ViewId, rev: u64, delta: D, new_len: usize,
-                  new_line_count: usize, undo_group: Option<usize>, edit_type: String, author: String) -> Self
-        where D: Into<Option<RopeDelta>>
+    pub fn new<D>(
+        view_id: ViewId,
+        rev: u64,
+        delta: D,
+        new_len: usize,
+        new_line_count: usize,
+        undo_group: Option<usize>,
+        edit_type: String,
+        author: String,
+    ) -> Self
+    where
+        D: Into<Option<RopeDelta>>,
     {
         let delta = delta.into();
         PluginUpdate { view_id, delta, new_len, new_line_count, rev, undo_group, edit_type, author }
@@ -276,9 +290,9 @@ impl PluginUpdate {
 impl TextUnit {
     /// Converts an offset in some unit to a concrete byte offset. Returns
     /// `None` if the input offset is out of bounds in its unit space.
-    pub fn resolve_offset<T: Borrow<Rope>>(&self, text: T, offset: usize) -> Option<usize> {
+    pub fn resolve_offset<T: Borrow<Rope>>(self, text: T, offset: usize) -> Option<usize> {
         let text = text.borrow();
-        match *self {
+        match self {
             TextUnit::Utf8 => {
                 if offset > text.len() {
                     None
@@ -320,12 +334,12 @@ mod tests {
             "author": "me"
     }"#;
 
-    let val: PluginUpdate = match serde_json::from_str(json) {
-        Ok(val) => val,
-        Err(err) => panic!("{:?}", err),
-    };
-    assert!(val.delta.is_some());
-    assert!(val.delta.unwrap().as_simple_insert().is_some());
+        let val: PluginUpdate = match serde_json::from_str(json) {
+            Ok(val) => val,
+            Err(err) => panic!("{:?}", err),
+        };
+        assert!(val.delta.is_some());
+        assert!(val.delta.unwrap().as_simple_insert().is_some());
     }
 
     #[test]
@@ -353,7 +367,7 @@ mod tests {
     fn test_de_plugin_rpc() {
         let json = r#"{"method": "alert", "params": {"view_id": "view-id-1", "plugin_id": 42, "msg": "ahhh!"}}"#;
         let de: PluginCommand<PluginNotification> = serde_json::from_str(json).unwrap();
-        assert_eq!(de.view_id, "view-id-1".into());
+        assert_eq!(de.view_id, ViewId(1));
         assert_eq!(de.plugin_id, PluginPid(42));
         match de.cmd {
             PluginNotification::Alert { ref msg } if msg == "ahhh!" => (),

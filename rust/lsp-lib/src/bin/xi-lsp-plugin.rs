@@ -22,8 +22,7 @@ extern crate log;
 
 use xi_lsp_lib::{start_mainloop, Config, LspPlugin};
 
-fn init_logger() -> Result<(),fern::InitError> {
-
+fn init_logger() -> Result<(), fern::InitError> {
     let level_filter = match std::env::var("XI_LOG") {
         Ok(level) => match level.to_lowercase().as_ref() {
             "trace" => log::LevelFilter::Trace,
@@ -31,10 +30,10 @@ fn init_logger() -> Result<(),fern::InitError> {
             _ => log::LevelFilter::Info,
         },
         // Default to info
-        Err(_) => log::LevelFilter::Info
+        Err(_) => log::LevelFilter::Info,
     };
 
-    Ok(fern::Dispatch::new()
+    fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
                 "{}[{}][{}] {}",
@@ -43,11 +42,11 @@ fn init_logger() -> Result<(),fern::InitError> {
                 record.level(),
                 message
             ))
-        })
-        .level(level_filter)
+        }).level(level_filter)
         .chain(std::io::stderr())
         .chain(fern::log_file("xi-lsp-plugin.log")?)
-        .apply()?)
+        .apply()
+        .map_err(|e| e.into())
 }
 
 fn main() {

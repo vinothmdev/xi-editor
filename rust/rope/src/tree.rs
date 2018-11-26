@@ -14,10 +14,10 @@
 
 //! A general b-tree structure suitable for ropes and the like.
 
-use std::sync::Arc;
 use std::cmp::min;
+use std::sync::Arc;
 
-use interval::Interval;
+use interval::{Interval, IntervalBounds};
 
 const MIN_CHILDREN: usize = 4;
 const MAX_CHILDREN: usize = 8;
@@ -25,14 +25,14 @@ const MAX_CHILDREN: usize = 8;
 pub trait NodeInfo: Clone {
     /// The type of the leaf.
     ///
-    /// A given NodeInfo is for exactly one type of leaf. That is why
+    /// A given `NodeInfo` is for exactly one type of leaf. That is why
     /// the leaf type is an associated type rather than a type parameter.
-    type L : Leaf;
+    type L: Leaf;
 
     /// An operator that combines info from two subtrees. It is intended
     /// (but not strictly enforced) that this operator be associative and
     /// obey an identity property. In mathematical terms, the accumulate
-    /// method is the sum operator of a monoid.
+    /// method is the operation of a monoid.
     fn accumulate(&mut self, other: &Self);
 
     /// A mapping from a leaf into the info type. It is intended (but
@@ -46,20 +46,23 @@ pub trait NodeInfo: Clone {
     /// The identity of the monoid. Need not be implemented because it
     /// can be computed from the leaf default.
     ///
-    /// This is hear to demonstrate that this is a monoid.
+    /// This is here to demonstrate that this is a monoid.
     fn identity() -> Self {
         Self::compute_info(&Self::L::default())
     }
 
-    /// The interval covered by this node. The default impl is sufficient for most types,
-    /// but interval trees may need to override it.
+    /// The interval covered by the first `len` base units of this node. The
+    /// default impl is sufficient for most types, but interval trees may need
+    /// to override it.
     fn interval(&self, len: usize) -> Interval {
-        Interval::new_closed_closed(0, len)
+        Interval::new(0, len)
     }
 }
 
+/// A trait for the leaves of trees of type [Node](struct.Node.html).
+///
+/// Two leafs can be concatenated using `push_maybe_split`.
 pub trait Leaf: Sized + Clone + Default {
-
     /// Measurement of leaf in base units.
     /// A 'base unit' refers to the smallest discrete unit
     /// by which a given concrete type can be indexed.
@@ -69,23 +72,23 @@ pub trait Leaf: Sized + Clone + Default {
     /// Generally a minimum size requirement for leaves.
     fn is_ok_child(&self) -> bool;
 
-    /// Combine other into self, optionly splitting in two.
-    /// Interval is in "base units".
-    /// Generally implements a maximum size.
+    /// Combine the part `other` denoted by the `Interval` `iv` into `self`,
+    /// optionly splitting off a new `Leaf` if `self` would have become too big.
+    /// Returns either `None` if no splitting was needed, or `Some(rest)` if
+    /// `rest` was split off.
     ///
-    /// TODO: What does Interval represent?
+    /// Interval is in "base units".  Generally implements a maximum size.
     ///
-    /// Invariants:
-    ///
+    /// # Invariants:
     /// - If one or the other input is empty, then no split.
-    /// - If either input satisfies is_ok_child, then on return self
-    /// satisfies this, as does the optional split.
+    /// - If either input satisfies `is_ok_child`, then, on return, `self`
+    ///   satisfies this, as does the optional split.
     fn push_maybe_split(&mut self, other: &Self, iv: Interval) -> Option<Self>;
 
-    /// same meaning as push_maybe_split starting from an empty
+    /// Same meaning as push_maybe_split starting from an empty
     /// leaf, but maybe can be implemented more efficiently?
     ///
-    /// TODO: remove if it doesn't pull its weight
+    // TODO: remove if it doesn't pull its weight
     fn subseq(&self, iv: Interval) -> Self {
         let mut result = Self::default();
         if result.push_maybe_split(self, iv).is_some() {
@@ -127,33 +130,43 @@ enum NodeVal<N: NodeInfo> {
 // also consider making Metric a newtype for usize, so type system can
 // help separate metrics
 
-/// A trait for quickly processing attributes of a NodeInfo.
+/// A trait for quickly processing attributes of a
+/// [NodeInfo](struct.NodeInfo.html).
 ///
 /// For the conceptual background see the
 /// [blog post, Rope science, part 2: metrics](https://github.com/google/xi-editor/blob/master/docs/docs/rope_science_02.md).
 pub trait Metric<N: NodeInfo> {
-    /// Return the number of boundarys in the NodeInfo::Leaf
+    /// Return the size of the
+    /// [NodeInfo::L](trait.NodeInfo.html#associatedtype.L), as measured by this
+    /// metric.
     ///
     /// The usize argument is the total size/length of the node, in base units.
-    fn measure(&N, usize) -> usize;
+    ///
+    /// # Examples
+    /// For the [LinesMetric](../rope/struct.LinesMetric.html), this gives the number of
+    /// lines in string contained in the leaf. For the
+    /// [BaseMetric](../rope/struct.BaseMetric.html), this gives the size of the string
+    /// in uft8 code units, that is, bytes.
+    ///
+    fn measure(info: &N, len: usize) -> usize;
 
     /// Returns the smallest offset, in base units, for an offset in measured units.
     ///
-    /// Invariants:
+    /// # Invariants:
     ///
     /// - `from_base_units(to_base_units(x)) == x` is True for valid `x`
     fn to_base_units(l: &N::L, in_measured_units: usize) -> usize;
 
     /// Returns the smallest offset in measured units corresponding to an offset in base units.
     ///
-    /// Invariants:
+    /// # Invariants:
     ///
     /// - `from_base_units(to_base_units(x)) == x` is True for valid `x`
     fn from_base_units(l: &N::L, in_base_units: usize) -> usize;
 
     /// Return whether the offset in base units is a boundary of this metric.
     /// If a boundary is at end of a leaf then this method must return true.
-    /// However, A boundary at the beginning of a leaf is optional
+    /// However, a boundary at the beginning of a leaf is optional
     /// (the previous leaf will be queried).
     fn is_boundary(l: &N::L, offset: usize) -> bool;
 
@@ -165,11 +178,10 @@ pub trait Metric<N: NodeInfo> {
     /// or None if no such boundary exists. Input and result are in base units.
     fn next(l: &N::L, offset: usize) -> Option<usize>;
 
-    /// Returns true if the measured units in this metric can span multiple leaves.
-    /// As an example, in a metric that measures lines in a rope,
-    /// a line may start in one leaf and end in another;
-    /// however in a metric measuring bytes,
-    /// storage of a single byte cannot extend across leaves.
+    /// Returns true if the measured units in this metric can span multiple
+    /// leaves.  As an example, in a metric that measures lines in a rope, a
+    /// line may start in one leaf and end in another; however in a metric
+    /// measuring bytes, storage of a single byte cannot extend across leaves.
     fn can_fragment() -> bool;
 }
 
@@ -177,13 +189,7 @@ impl<N: NodeInfo> Node<N> {
     pub fn from_leaf(l: N::L) -> Node<N> {
         let len = l.len();
         let info = N::compute_info(&l);
-        Node(Arc::new(
-            NodeBody {
-            height: 0,
-            len,
-            info,
-            val: NodeVal::Leaf(l),
-        }))
+        Node(Arc::new(NodeBody { height: 0, len, info, val: NodeVal::Leaf(l) }))
     }
 
     fn from_nodes(nodes: Vec<Node<N>>) -> Node<N> {
@@ -194,13 +200,7 @@ impl<N: NodeInfo> Node<N> {
             len += child.0.len;
             info.accumulate(&child.0.info);
         }
-        Node(Arc::new(
-            NodeBody {
-            height,
-            len,
-            info,
-            val: NodeVal::Internal(nodes),
-        }))
+        Node(Arc::new(NodeBody { height, len, info, val: NodeVal::Internal(nodes) }))
     }
 
     pub fn len(&self) -> usize {
@@ -227,12 +227,14 @@ impl<N: NodeInfo> Node<N> {
         }
     }
 
-    /// Returns the first child with a positive measure, starting from the `j`th.
-    /// Also, returns the offset we have skipped; note that if it returns `None`in the first component, we skip all the children.
+    /// Returns the first child with a positive measure, starting from the
+    /// `j`th.  Also, returns the length in base units of the children we have
+    /// skipped. Note that if it returns `None` in the first component, we skip
+    /// all the children.
     fn next_positive_measure_child<M: Metric<N>>(&self, j: usize) -> (Option<usize>, usize) {
         let children = self.get_children();
         let mut offset = 0;
-        for i in j .. children.len() {
+        for i in j..children.len() {
             if children[i].measure::<M>() > 0 {
                 return (Some(i), offset);
             } else {
@@ -253,7 +255,7 @@ impl<N: NodeInfo> Node<N> {
     fn is_ok_child(&self) -> bool {
         match self.0.val {
             NodeVal::Leaf(ref l) => l.is_ok_child(),
-            NodeVal::Internal(ref nodes) => (nodes.len() >= MIN_CHILDREN)
+            NodeVal::Internal(ref nodes) => (nodes.len() >= MIN_CHILDREN),
         }
     }
 
@@ -283,7 +285,7 @@ impl<N: NodeInfo> Node<N> {
             let node1 = Arc::make_mut(&mut rope1.0);
             let leaf2 = rope2.get_leaf();
             if let NodeVal::Leaf(ref mut leaf1) = node1.val {
-                let leaf2_iv = Interval::new_closed_closed(0, leaf2.len());
+                let leaf2_iv = Interval::new(0, leaf2.len());
                 let new = leaf1.push_maybe_split(leaf2, leaf2_iv);
                 node1.len = leaf1.len();
                 node1.info = N::compute_info(leaf1);
@@ -292,15 +294,8 @@ impl<N: NodeInfo> Node<N> {
                 panic!("merge_leaves called on non-leaf");
             }
         } {
-            Some(new) => {
-                Node::from_nodes(vec![
-                    rope1,
-                    Node::from_leaf(new),
-                ])
-            }
-            None => {
-                rope1
-            }
+            Some(new) => Node::from_nodes(vec![rope1, Node::from_leaf(new)]),
+            None => rope1,
         }
     }
 
@@ -322,7 +317,7 @@ impl<N: NodeInfo> Node<N> {
                 } else {
                     Node::merge_nodes(newrope.get_children(), &children2[1..])
                 }
-            },
+            }
             Ordering::Equal => {
                 if rope1.is_ok_child() && rope2.is_ok_child() {
                     return Node::from_nodes(vec![rope1, rope2]);
@@ -331,7 +326,7 @@ impl<N: NodeInfo> Node<N> {
                     return Node::merge_leaves(rope1, rope2);
                 }
                 Node::merge_nodes(rope1.get_children(), rope2.get_children())
-            },
+            }
             Ordering::Greater => {
                 let children1 = rope1.get_children();
                 if h2 == h1 - 1 && rope2.is_ok_child() {
@@ -352,43 +347,7 @@ impl<N: NodeInfo> Node<N> {
         M::measure(&self.0.info, self.0.len)
     }
 
-    /*
-    // TODO: not sure if this belongs in the public interface, cursor
-    // might subsume all real use cases.
-    // calls the given function with leaves forming the sequence
-    fn visit_subseq<F>(&self, iv: Interval, f: &mut F)
-            where F: FnMut(&N::L) -> () {
-        if iv.is_empty() {
-            return;
-        }
-        match self.0.val {
-            NodeVal::Leaf(ref l) => {
-                if iv == Interval::new_closed_closed(0, l.len()) {
-                    f(l);
-                } else {
-                    f(&l.clone().subseq(iv));
-                }
-            }
-            NodeVal::Internal(ref v) => {
-                let mut offset = 0;
-                for child in v {
-                    if iv.is_before(offset) {
-                        break;
-                    }
-                    let child_iv = Interval::new_closed_closed(0, child.len());
-                    // easier just to use signed ints?
-                    let rec_iv = iv.intersect(child_iv.translate(offset))
-                        .translate_neg(offset);
-                    child.visit_subseq::<F>(rec_iv, f);
-                    offset += child_iv.size();
-                }
-                return;
-            }
-        }
-    }
-    */
-
-    pub fn push_subseq(&self, b: &mut TreeBuilder<N>, iv: Interval) {
+    pub(crate) fn push_subseq(&self, b: &mut TreeBuilder<N>, iv: Interval) {
         if iv.is_empty() {
             return;
         }
@@ -408,8 +367,7 @@ impl<N: NodeInfo> Node<N> {
                     }
                     let child_iv = child.interval();
                     // easier just to use signed ints?
-                    let rec_iv = iv.intersect(child_iv.translate(offset))
-                        .translate_neg(offset);
+                    let rec_iv = iv.intersect(child_iv.translate(offset)).translate_neg(offset);
                     child.push_subseq(b, rec_iv);
                     offset += child.len();
                 }
@@ -418,24 +376,32 @@ impl<N: NodeInfo> Node<N> {
         }
     }
 
-    pub fn subseq(&self, iv: Interval) -> Node<N> {
+    pub fn subseq<T: IntervalBounds>(&self, iv: T) -> Node<N> {
+        let iv = iv.into_interval(self.len());
         let mut b = TreeBuilder::new();
         self.push_subseq(&mut b, iv);
         b.build()
     }
 
-    pub fn edit(&mut self, iv: Interval, new: Node<N>) {
+    pub fn edit<T, IV>(&mut self, iv: IV, new: T)
+    where
+        T: Into<Node<N>>,
+        IV: IntervalBounds,
+    {
         let mut b = TreeBuilder::new();
-        let self_iv = Interval::new_closed_closed(0, self.len());
+        let iv = iv.into_interval(self.len());
+        let self_iv = self.interval();
         self.push_subseq(&mut b, self_iv.prefix(iv));
-        b.push(new);
+        b.push(new.into());
         self.push_subseq(&mut b, self_iv.suffix(iv));
         *self = b.build();
     }
 
     // doesn't deal with endpoint, handle that specially if you need it
     pub fn convert_metrics<M1: Metric<N>, M2: Metric<N>>(&self, mut m1: usize) -> usize {
-        if m1 == 0 { return 0; }
+        if m1 == 0 {
+            return 0;
+        }
         // If M1 can fragment, then we must land on the leaf containing
         // the m1 boundary. Otherwise, we can land on the beginning of
         // the leaf immediately following the M1 boundary, which may be
@@ -473,12 +439,49 @@ impl<N: NodeInfo> TreeBuilder<N> {
         TreeBuilder(None)
     }
 
-    // TODO: more sophisticated implementation, so pushing a sequence
-    // is amortized O(n), rather than O(n log n) as now.
+    /// Push a node on the accumulating tree by concatenating it.
+    ///
+    /// This method is O(log n), where `n` is the amount of nodes already in the accumulating tree.
+    /// The worst case happens when all nodes having exactly MAX_CHILDREN children
+    /// and the node being pushed is a leaf or equivalently has height 1.
+    /// Then `log n` nodes have to be created before the leaf can be added, to keep all leaves on the same height.
     pub fn push(&mut self, n: Node<N>) {
         match self.0.take() {
             None => self.0 = Some(n),
-            Some(buf) => self.0 = Some(Node::concat(buf, n))
+            Some(buf) => self.0 = Some(Node::concat(buf, n)),
+        }
+    }
+
+    /// Add leaves to accumulating tree.
+    ///
+    /// Creates a stack of node lists, where all the nodes in a list have uniform node height.
+    /// The stack is height sorted in ascending order.
+    /// The length of any list in the stack is at most MAX_CHILDREN -1.
+    ///
+    /// Example of this kind of stack if MAX_CHILDREN = 3:
+    /// let n_i be some node of height i. Let the front of the array represent the top of the stack.
+    /// `[[n_1, n_1], [n_2], [n_3, n_3]]`
+    ///
+    /// The nodes in the stack are pushed on the accumulating tree one by one in the end.
+    pub fn push_leaves(&mut self, leaves: Vec<N::L>) {
+        let mut stack: Vec<Vec<Node<N>>> = Vec::new();
+        for leaf in leaves {
+            let mut new = Node::from_leaf(leaf);
+            loop {
+                if stack.last().map_or(true, |r| r[0].height() != new.height()) {
+                    stack.push(Vec::new());
+                }
+                stack.last_mut().unwrap().push(new);
+                if stack.last().unwrap().len() < MAX_CHILDREN {
+                    break;
+                }
+                new = Node::from_nodes(stack.pop().unwrap())
+            }
+        }
+        for v in stack {
+            for r in v {
+                self.push(r)
+            }
         }
     }
 
@@ -493,7 +496,7 @@ impl<N: NodeInfo> TreeBuilder<N> {
     pub fn build(self) -> Node<N> {
         match self.0 {
             Some(r) => r,
-            None => Node::from_leaf(N::L::default())
+            None => Node::from_leaf(N::L::default()),
         }
     }
 }
@@ -535,8 +538,8 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
     pub fn set(&mut self, position: usize) {
         self.position = position;
         if let Some(l) = self.leaf {
-            if self.position >= self.offset_of_leaf &&
-                    self.position < self.offset_of_leaf + l.len() {
+            if self.position >= self.offset_of_leaf && self.position < self.offset_of_leaf + l.len()
+            {
                 return;
             }
         }
@@ -553,13 +556,11 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
             // not at a valid position
             return false;
         }
-        if self.position == 0 ||
-                (self.position == self.offset_of_leaf && !M::can_fragment()) {
+        if self.position == 0 || (self.position == self.offset_of_leaf && !M::can_fragment()) {
             return true;
         }
         if self.position > self.offset_of_leaf {
-            return M::is_boundary(self.leaf.unwrap(),
-                self.position - self.offset_of_leaf);
+            return M::is_boundary(self.leaf.unwrap(), self.position - self.offset_of_leaf);
         }
         // tricky case, at beginning of leaf, need to query end of previous
         // leaf; TODO: would be nice if we could do it another way that didn't
@@ -641,7 +642,7 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
                     return Some(self.root.len());
                 }
                 let (node, j) = self.cache[i].unwrap();
-                let (next_j, offset) = node.next_positive_measure_child::<M>(j+1);
+                let (next_j, offset) = node.next_positive_measure_child::<M>(j + 1);
                 self.position += offset;
                 if let Some(next_j) = next_j {
                     self.cache[i] = Some((node, next_j));
@@ -674,8 +675,9 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
         if let Some(l) = self.leaf {
             let offset_in_leaf = self.position - self.offset_of_leaf;
             if let Some(offset_in_leaf) = M::next(l, offset_in_leaf) {
-                if offset_in_leaf == l.len() &&
-                        self.offset_of_leaf + offset_in_leaf != self.root.len() {
+                if offset_in_leaf == l.len()
+                    && self.offset_of_leaf + offset_in_leaf != self.root.len()
+                {
                     let _ = self.next_leaf();
                 } else {
                     self.position = self.offset_of_leaf + offset_in_leaf;
@@ -788,106 +790,33 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
     }
 }
 
-/*
-
-// How to access the slice type for a leaf, if available. This will
-// be super helpful in building a chunk iterator (which requires
-// slices if it's going to conform to Rust's iterator protocol)
-fn slice<'a, L: Leaf + Index<RangeFull>>(l: &'a L) -> &'a L::Output {
-    l.index(RangeFull)
-}
-*/
-
-/*
-// TODO: the following is an example, written during development but
-// not actually used. Either make it real or delete it.
-
-#[derive(Clone, Default)]
-struct BytesLeaf(Vec<u8>);
-
-#[derive(Clone)]
-struct BytesInfo(usize);
-
-// leaf doesn't have to be a newtype
-impl Leaf for Vec<u8> {
-    fn len(&self) -> usize {
-        self.len()
-    }
-
-    fn is_ok_child(&self) -> bool {
-        self.len() >= 512
-    }
-
-    fn push_maybe_split(&mut self, other: &Vec<u8>, iv: Interval) -> Option<Vec<u8>> {
-        let (start, end) = iv.start_end();
-        self.extend_from_slice(&other[start..end]);
-        if self.len() <= 1024 {
-            None
-        } else {
-            let splitpoint = self.len() / 2;
-            let new = self[splitpoint..].to_owned();
-            self.truncate(splitpoint);
-            Some(new)
-        }
-    }
-}
-
-impl NodeInfo for BytesInfo {
-    type L = Vec<u8>;
-    type BaseMetric = BytesMetric;
-    fn accumulate(&mut self, other: &Self) {
-        self.0 += other.0;
-    }
-
-    fn compute_info(l: &Vec<u8>) -> BytesInfo {
-        BytesInfo(l.len())
-    }
-}
-
-struct BytesMetric(());
-
-impl Metric<BytesInfo> for BytesMetric {
-    fn measure(_: &BytesInfo, len: usize) -> usize {
-        len
-    }
-
-    fn to_base_units(_: &Vec<u8>, in_measured_units: usize) -> usize {
-        in_measured_units
-    }
-
-    fn from_base_units(_: &Vec<u8>, in_base_units: usize) -> usize {
-        in_base_units
-    }
-
-    fn is_boundary(_: &Vec<u8>, _: usize) -> bool { true }
-
-    fn prev(_: &Vec<u8>, offset: usize) -> Option<usize> {
-        if offset > 0 { Some(offset - 1) } else { None }
-    }
-
-    fn next(l: &Vec<u8>, offset: usize) -> Option<usize> {
-        if offset < l.len() { Some(offset + 1) } else { None }
-    }
-
-    fn can_fragment() -> bool { false }
-}
-
-*/
-
 #[cfg(test)]
 mod test {
-    use ::rope::*;
     use super::*;
+    use rope::*;
 
     fn build_triangle(n: u32) -> String {
         let mut s = String::new();
         let mut line = String::new();
-        for _ in 0 .. n {
+        for _ in 0..n {
             s += &line;
             s += "\n";
             line += "a";
         }
         s
+    }
+
+    #[test]
+    fn eq_rope_with_stack() {
+        let n = 2_000;
+        let s = build_triangle(n);
+        let mut builder_default = TreeBuilder::new();
+        let mut builder_stacked = TreeBuilder::new();
+        builder_default.push_str(&s);
+        builder_stacked.push_str_stacked(&s);
+        let tree_default = builder_default.build();
+        let tree_stacked = builder_stacked.build();
+        assert_eq!(tree_default, tree_stacked);
     }
 
     #[test]
@@ -897,7 +826,7 @@ mod test {
 
         let mut cursor = Cursor::new(&text, 0);
         let mut prev_offset = cursor.pos();
-        for i in 1..(n+1) as usize {
+        for i in 1..(n + 1) as usize {
             let offset = cursor.next::<LinesMetric>().expect("arrived at the end too soon");
             assert_eq!(offset - prev_offset, i);
             prev_offset = offset;
@@ -929,10 +858,10 @@ mod test {
             let mut c = Cursor::new(&r, i);
             let it = c.next::<LinesMetric>();
             let pos = c.pos();
-            assert!(s.as_bytes()[i..pos-1].iter().all(|c| *c != b'\n'), "missed linebreak");
+            assert!(s.as_bytes()[i..pos - 1].iter().all(|c| *c != b'\n'), "missed linebreak");
             if pos < s.len() {
                 assert!(it.is_some(), "must be Some(_)");
-                assert!(s.as_bytes()[pos-1]  == b'\n', "not a linebreak");
+                assert!(s.as_bytes()[pos - 1] == b'\n', "not a linebreak");
             }
         }
     }
@@ -961,7 +890,7 @@ mod test {
 
             if pos > 0 {
                 assert!(it.is_some(), "must be Some(_)");
-                assert!(s.as_bytes()[pos-1]  == b'\n', "not a linebreak");
+                assert!(s.as_bytes()[pos - 1] == b'\n', "not a linebreak");
             }
         }
     }

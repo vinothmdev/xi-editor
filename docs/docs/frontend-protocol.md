@@ -73,8 +73,14 @@ note for `new_view`. Errors are not currently reported.
 
 `set_theme {"theme_name": "InspiredGitHub"}`
 
-Requests that core change the theme. If the change succeeds the client
+Asks core to change the theme. If the change succeeds the client
 will receive a `theme_changed` notification.
+
+### set_language
+`set_language {"view-id":"view-id-1", "language_id":"Rust"}`
+
+Asks core to change the language of the buffer associated with the `view_id`.
+If the change succeeds the client will receive a `language_changed` notification.
 
 ### modify_user_config
 
@@ -116,6 +122,18 @@ Inserts the `chars` string at the current cursor locations. If there are
 multiple cursors and `chars` has the same number of lines as there are
 cursors, one line will be inserted at each cursor, in order; otherwise the full
 string will be inserted at each cursor.
+
+#### copy
+
+`copy -> String|Null`
+
+Copies the active selection, returning their contents or `Null` if the selection was empty.
+
+#### cut
+
+`cut -> String|Null`
+
+Cut the active selection, returning their contents or `Null` if the selection was empty.
 
 #### cancel_operation
 
@@ -176,6 +194,13 @@ multi_line_select # adds a line to the selection
 multi_word_select # adds a word to the selection
 ```
 
+#### goto_line
+
+`goto_line {"line": 1}`
+
+Sets the cursor to the beginning of the provided `line` and scrolls to
+this position.
+
 #### Other movement and deletion commands
 
 The following edit methods take no parameters, and have similar
@@ -187,6 +212,7 @@ that takes a "movement" enum as a parameter.
 delete_backward
 delete_forward
 insert_newline
+duplicate_line
 move_up
 move_up_and_modify_selection
 move_down
@@ -199,6 +225,11 @@ scroll_page_up
 page_up_and_modify_selection
 scroll_page_down
 page_down_and_modify_selection
+yank
+transpose
+select_all
+add_selection_above
+add_selection_below
 ```
 
 #### Transformations
@@ -208,8 +239,46 @@ The following methods act by modifying the current selection.
 ```
 uppercase
 lowercase
+capitalize
 indent
 outdent
+```
+
+#### Number Transformations
+
+The following methods work with a caret or multiple selections. If the beginning of a selection (or the caret) is within a positive or negative number, the number will be transformed accordingly:
+
+```
+increase_number
+decrease_number
+```
+
+#### Recording
+
+These methods allow manipulation and playback of event recordings.
+
+- If there is no currently active recording, start recording events under the provided name.
+- If there is no provided name, the current recording is saved.
+- If the name provided matches the current recording name, the current recording is saved.
+- If the name provided does not match the current recording name, the events for the current recording are dismissed.
+```
+toggle_recording {
+    "recording_name"?: string
+}
+```
+
+Execute a set of recorded events and modify the document state:
+```
+play_recording {
+    "recording_name": string
+}
+```
+
+Completely remove a specific recording:
+```
+clear_recording {
+    "recording_name": string
+}
 ```
 
 ### Language Support Oriented features (in Edit Namespace)
@@ -279,6 +348,17 @@ or a request.
 Parameters `regex` and `whole_words` are optional and by default `false`.
 
 Sets the current search query and options.
+
+#### multi_find
+
+This find command supports multiple search queries.
+
+`multi_find [{"id": 1, "chars": "a", "case_sensitive": false, "regex": false, "whole_words": true}]`
+Parameters `regex` and `whole_words` are optional and by default `false`. `id` is an optional parameter
+used to uniquely identify a search query. If left empty, the query is considered as a new query and
+the backend will generate a new ID.
+
+Sets the current search queries and options.
 
 #### find_next and find_previous
 
@@ -441,7 +521,7 @@ certainly represent at least initial and trailing sequences of invalid lines by
 their count; and the editing operations may be more efficiently done in-place
 than by copying from the old state to the new].
 
-The "copy" op appends the `n` lines `[old_ix: old_ix + n]` to the new lines
+The "copy" op appends the `n` lines `[old_ix .. old_ix + n]` to the new lines
 array, and increments `old_ix` by `n`.
 
 The "skip" op increments `old_ix` by `n`.
@@ -502,6 +582,16 @@ interface Line {
 }
 ```
 
+#### measure_width
+
+```
+measure_width [{"id": number, "strings": string[]}] <- {"id":0, "result":[[28.0,8.0]]}
+```
+
+Asks the frontend to measure the display widths (the width when rendered and presented on screen) of a group of strings. The frontend should return an array of arrays, one for each item in the input array, containing the widths of each of that item's strings when rendered with the style indicated by that items id argument.
+
+These widths are used to determine how to [calculate line breaks](https://xi-editor.github.io/xi-editor/docs/rope_science_05.html) and other attributes that depend on the behaviour of the client's text rendering system.
+
 ---
 
 #### theme_changed
@@ -512,6 +602,25 @@ Notifies the client that the theme has been changed. The client should
 use the new theme to set colors as appropriate. The `Theme` object is
 directly serialized from a [`syntect::highlighting::ThemeSettings`](https://github.com/trishume/syntect/blob/master/src/highlighting/theme.rs#L27)
 instance.
+
+
+#### available_themes
+
+`available_themes {"themes": ["InspiredGitHub"]}`
+
+Notifies the client of the available themes.
+
+#### language_changed
+
+`language_changed {"view_id": "view-id-1", "language_id": "Rust"}`
+
+Notifies the client that the language used for syntax highlighting has been changed.
+
+#### available_languages
+
+`available_languages {"languages": ["Rust"]}`
+
+Notifies the client of the available languages.
 
 #### config_changed
 
@@ -622,9 +731,11 @@ Removes a status item from the front end.
 
 #### find_status
 
-`find_status {"view_id": "view-id-1", "queries": [{"chars": "a", "case_sensitive": false, "is_regex": false, "whole_words": true, "matches": 6}]}`
+Find supports multiple search queries.
 
-Notifies the client about the current search queries and search options.
+`find_status {"view_id": "view-id-1", "queries": [{"id": 1, "chars": "a", "case_sensitive": false, "is_regex": false, "whole_words": true, "matches": 6, "lines": [1, 3, 3, 6]}]}`
+
+Notifies the client about the current search queries and search options. `lines` indicates for each match its line number.
 
 #### replace_status
 
