@@ -7,7 +7,7 @@
 
 <h4 align="center">A modern editor with a backend written in Rust.</h4>
 
-***Note:*** *This is repo contains only the editor core, which is not usable on its own. For editors based on it, check out the list in [Frontends](#frontends).*
+***Note:*** *This repo contains only the editor core, which is not usable on its own. For editors based on it, check out the list in [Frontends](#frontends).*
 
 The xi-editor project is an attempt to build a high quality text editor,
 using modern software engineering techniques. It is initially built for
@@ -32,7 +32,7 @@ Goals include:
 **Learn more** with the creator of Xi, Raph Levien, in this [Recurse Center Localhost talk](https://www.recurse.com/events/localhost-raph-levien
 ).
 
-Screenshot (will need to be updated as syntax coloring and UI polish is added):
+Screenshot:
 
 ![xi-mac screenshot](/docs/docs/img/xi-mac-screenshot.png?raw=true)
 
@@ -46,7 +46,7 @@ below.
 ### Building the core
 
 Xi-editor targets 'recent stable Rust'. We recommend installing via [rustup](https://www.rustup.rs).
-The current minimum supported version is 1.29.
+The current minimum supported version is 1.40.
 
 To build the xi-editor core from the root directory of this repo:
 
@@ -62,21 +62,21 @@ Here are some front-ends in various stages of development:
 
 * [xi-mac](https://github.com/xi-editor/xi-mac), the official macOS front-end.
 
-* [fuchsia/xi](https://fuchsia.googlesource.com/topaz/+/master/bin/xi/), a front-end in Flutter for Fuchsia.
-
 * [xi-gtk](https://github.com/eyelash/xi-gtk), a GTK+ front-end.
 
 * [xi-term](https://github.com/xi-frontend/xi-term), a text UI.
 
 * [xi-electron](https://github.com/acheronfail/xi-electron), a cross-platform front-end based on web-technologies.
 
-* [gxi](https://github.com/bvinc/gxi), a GTK+ front-end written in Rust.
+* [Tau](https://gitlab.gnome.org/World/Tau), a GTK+ front-end written in Rust. Forked from https://github.com/bvinc/gxi, which was abandoned.
 
 * [xi-win](https://github.com/xi-editor/xi-win), an experimental Windows front-end written in Rust.
 
 * [kod](https://github.com/linde12/kod), a terminal frontend written in Golang.
 
 * [xi-qt](https://github.com/sw5cc/xi-qt), a Qt front-end.
+
+* [vixi](https://github.com/Peltoche/vixi), a Vim like front-end in Rust.
 
 The following are currently inactive, based on earlier versions of the front-end
 protocol, but perhaps could be revitalized:

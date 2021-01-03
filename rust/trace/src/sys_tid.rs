@@ -12,23 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use libc;
-
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[inline]
 pub fn current_tid() -> Result<u64, libc::c_int> {
-    use std::mem::uninitialized;
-
     #[link(name = "pthread")]
     extern "C" {
-        fn pthread_threadid_np(
-            thread: libc::pthread_t,
-            thread_id: *mut libc::uint64_t,
-        ) -> libc::c_int;
+        fn pthread_threadid_np(thread: libc::pthread_t, thread_id: *mut u64) -> libc::c_int;
     }
 
     unsafe {
-        let mut tid: libc::uint64_t = uninitialized();
+        let mut tid = 0;
         let err = pthread_threadid_np(0, &mut tid);
         match err {
             0 => Ok(tid),
@@ -61,20 +54,16 @@ pub fn current_tid() -> Result<u64, libc::c_int> {
 
 // TODO: maybe use https://github.com/alexcrichton/cfg-if to simplify this?
 // pthread-based fallback
-#[cfg(
-    all(
-        target_family = "unix",
-        not(
-            any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "linux",
-                target_os = "android",
-                target_os = "fuchsia"
-            )
-        )
-    )
-)]
+#[cfg(all(
+    target_family = "unix",
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "fuchsia"
+    ))
+))]
 pub fn current_tid() -> Result<u64, libc::c_int> {
     unsafe { Ok(libc::pthread_self() as u64) }
 }

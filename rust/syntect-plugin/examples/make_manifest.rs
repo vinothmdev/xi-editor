@@ -13,7 +13,6 @@
 // limitations under the License.
 
 //! A simple tool that generates the syntect plugin's manifest.
-
 extern crate syntect;
 extern crate toml;
 extern crate xi_core_lib as xi_core;
@@ -22,12 +21,13 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use crate::xi_core::plugin_manifest::*;
+use crate::xi_core::LanguageDefinition;
+use syntect::dumps::dump_to_file;
+use syntect::parsing::{SyntaxReference, SyntaxSetBuilder};
 use toml::Value;
-use xi_core::plugin_manifest::*;
-use xi_core::LanguageDefinition;
 
-const OUT_FILE_NAME: &str = "generated_manifest.toml";
+const OUT_FILE_NAME: &str = "manifest.toml";
 
 /// Extracts the name and version from Cargo.toml
 fn parse_name_and_version() -> Result<(String, String), io::Error> {
@@ -42,7 +42,20 @@ fn parse_name_and_version() -> Result<(String, String), io::Error> {
 }
 
 fn main() -> Result<(), io::Error> {
-    let syntax_set = SyntaxSet::load_defaults_newlines();
+    let package_dir = "syntect-resources/Packages";
+    let packpath = "assets/default.packdump";
+    let metasource = "syntect-resources/DefaultPackage";
+    let metapath = "assets/default_meta.packdump";
+
+    let mut builder = SyntaxSetBuilder::new();
+    builder.add_plain_text_syntax();
+    builder.add_from_folder(package_dir, true).unwrap();
+    builder.add_from_folder(metasource, false).unwrap();
+    let syntax_set = builder.build();
+
+    dump_to_file(&syntax_set, packpath).unwrap();
+    dump_to_file(&syntax_set.metadata(), metapath).unwrap();
+
     let lang_defs = syntax_set
         .syntaxes()
         .iter()
@@ -66,13 +79,21 @@ fn main() -> Result<(), io::Error> {
     let toml_str = toml::to_string(&mani).unwrap();
     let file_path = Path::new(OUT_FILE_NAME);
     let mut f = File::create(file_path)?;
+
     f.write_all(toml_str.as_ref())
 }
 
 fn lang_from_syn<'a>(src: &'a SyntaxReference) -> LanguageDefinition {
+    let mut extensions = src.file_extensions.clone();
+
+    // add support for .xiconfig
+    if extensions.contains(&String::from("toml")) {
+        extensions.push(String::from("xiconfig"));
+    }
+
     LanguageDefinition {
         name: src.name.as_str().into(),
-        extensions: src.file_extensions.clone(),
+        extensions,
         first_line_match: src.first_line_match.clone(),
         scope: src.scope.to_string(),
         default_config: None,

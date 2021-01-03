@@ -16,10 +16,10 @@
 
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{self, Value};
 
-use syntax::{LanguageDefinition, LanguageId};
+use crate::syntax::{LanguageDefinition, LanguageId};
 
 /// Describes attributes and capabilities of a plugin.
 ///
@@ -33,6 +33,7 @@ pub struct PluginDescription {
     pub scope: PluginScope,
     // more metadata ...
     /// path to plugin executable
+    #[serde(deserialize_with = "platform_exec_path")]
     pub exec_path: PathBuf,
     /// Events that cause this plugin to run
     #[serde(default)]
@@ -41,6 +42,15 @@ pub struct PluginDescription {
     pub commands: Vec<Command>,
     #[serde(default)]
     pub languages: Vec<LanguageDefinition>,
+}
+
+fn platform_exec_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+    let exec_path = PathBuf::deserialize(deserializer)?;
+    if cfg!(windows) {
+        Ok(exec_path.with_extension("exe"))
+    } else {
+        Ok(exec_path)
+    }
 }
 
 /// `PluginActivation`s represent events that trigger running a plugin.
@@ -209,10 +219,7 @@ impl PlaceholderRpc {
 impl PluginDescription {
     /// Returns `true` if this plugin is globally scoped, else `false`.
     pub fn is_global(&self) -> bool {
-        match self.scope {
-            PluginScope::Global => true,
-            _ => false,
-        }
+        matches!(self.scope, PluginScope::Global)
     }
 }
 
@@ -226,6 +233,28 @@ impl Default for PluginScope {
 mod tests {
     use super::*;
     use serde_json;
+
+    #[test]
+    fn platform_exec_path() {
+        let json = r#"
+        {
+            "name": "test_plugin",
+            "version": "0.0.0",
+            "scope": "global",
+            "exec_path": "path/to/binary",
+            "activations": [],
+            "commands": [],
+            "languages": []
+        }
+        "#;
+
+        let plugin_desc: PluginDescription = serde_json::from_str(&json).unwrap();
+        if cfg!(windows) {
+            assert!(plugin_desc.exec_path.ends_with("binary.exe"));
+        } else {
+            assert!(plugin_desc.exec_path.ends_with("binary"));
+        }
+    }
 
     #[test]
     fn test_serde_command() {

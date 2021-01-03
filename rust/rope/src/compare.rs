@@ -13,10 +13,10 @@
 // limitations under the License.
 
 //! Fast comparison of rope regions, principally for diffing.
+use crate::rope::{BaseMetric, Rope, RopeInfo};
+use crate::tree::Cursor;
 
-use rope::{BaseMetric, Rope, RopeInfo};
-use tree::Cursor;
-
+#[allow(dead_code)]
 const SSE_STRIDE: usize = 16;
 
 /// Given two 16-byte slices, returns a bitmask where the 1 bits indicate
@@ -39,7 +39,7 @@ const SSE_STRIDE: usize = 16;
 /// # }
 /// ```
 ///
-#[cfg_attr(feature = "cargo-clippy", allow(cast_ptr_alignment, unreadable_literal))]
+#[allow(clippy::cast_ptr_alignment, clippy::unreadable_literal)]
 #[doc(hidden)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
@@ -57,10 +57,11 @@ pub unsafe fn sse_compare_mask(one: &[u8], two: &[u8]) -> i32 {
     (!_mm_movemask_epi8(mask)) ^ HIGH_HALF_MASK as i32
 }
 
+#[allow(dead_code)]
 const AVX_STRIDE: usize = 32;
 
 /// Like above but with 32 byte slices
-#[cfg_attr(feature = "cargo-clippy", allow(cast_ptr_alignment))]
+#[allow(clippy::cast_ptr_alignment, clippy::unreadable_literal)]
 #[doc(hidden)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -74,23 +75,27 @@ pub unsafe fn avx_compare_mask(one: &[u8], two: &[u8]) -> i32 {
 
 /// Returns the lowest `i` for which `one[i] != two[i]`, if one exists.
 pub fn ne_idx(one: &[u8], two: &[u8]) -> Option<usize> {
-    if is_x86_feature_detected!("avx2") {
-        unsafe { ne_idx_avx(one, two) }
-    } else if is_x86_feature_detected!("sse4.2") {
-        unsafe { ne_idx_sse(one, two) }
-    } else {
-        ne_idx_fallback(one, two)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { ne_idx_avx(one, two) };
+        } else if is_x86_feature_detected!("sse4.2") {
+            return unsafe { ne_idx_sse(one, two) };
+        }
     }
+    ne_idx_fallback(one, two)
 }
 
 /// Returns the lowest `i` such that `one[one.len()-i] != two[two.len()-i]`,
 /// if one exists.
 pub fn ne_idx_rev(one: &[u8], two: &[u8]) -> Option<usize> {
-    if is_x86_feature_detected!("sse4.2") {
-        unsafe { ne_idx_rev_sse(one, two) }
-    } else {
-        ne_idx_rev_fallback(one, two)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse4.2") {
+            return unsafe { ne_idx_rev_sse(one, two) };
+        }
     }
+    ne_idx_rev_fallback(one, two)
 }
 
 #[doc(hidden)]

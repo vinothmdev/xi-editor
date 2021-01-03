@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 #![feature(test)]
 
 extern crate test;
@@ -170,4 +169,32 @@ fn hash_diff_big(b: &mut Bencher) {
 
     let _result = delta.unwrap().apply(&one);
     assert_eq!(String::from(_result), String::from(&two));
+}
+
+#[bench]
+fn simple_insertion(b: &mut Bencher) {
+    let one: Rope =
+        ["start", EDITOR_STR, VIEW_STR, INTERVAL_STR, BREAKS_STR, "end"].concat().into();
+    let two = "startend".into();
+    let mut delta: Option<RopeDelta> = None;
+    b.iter(|| {
+        delta = Some(LineHashDiff::compute_delta(&one, &two));
+    });
+
+    let _result = delta.unwrap().apply(&one);
+    assert_eq!(String::from(_result), String::from(&two));
+}
+
+#[bench]
+fn simple_deletion(b: &mut Bencher) {
+    let one: Rope =
+        ["start", EDITOR_STR, VIEW_STR, INTERVAL_STR, BREAKS_STR, "end"].concat().into();
+    let two = "startend".into();
+    let mut delta: Option<RopeDelta> = None;
+    b.iter(|| {
+        delta = Some(LineHashDiff::compute_delta(&two, &one));
+    });
+
+    let _result = delta.unwrap().apply(&two);
+    assert_eq!(String::from(_result), String::from(&one));
 }

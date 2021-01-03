@@ -14,25 +14,28 @@
 
 use std::cell::RefCell;
 use std::cmp::{max, min};
+use std::iter;
 use std::ops::Range;
 
 use serde_json::Value;
 
-use client::Client;
-use edit_types::ViewEvent;
-use find::{Find, FindStatus};
-use line_cache_shadow::{self, LineCacheShadow, RenderPlan, RenderTactic};
-use linewrap;
-use movement::{region_movement, selection_movement, Movement};
-use rpc::{FindQuery, GestureType, MouseAction, SelectionModifier};
-use selection::{Affinity, InsertDrift, SelRegion, Selection};
-use styles::{Style, ThemeStyleMap};
-use tabs::{BufferId, Counter, ViewId};
-use width_cache::WidthCache;
-use word_boundaries::WordCursor;
-use xi_rope::breaks::{Breaks, BreaksBaseMetric, BreaksInfo, BreaksMetric};
+use crate::annotations::{AnnotationStore, Annotations, ToAnnotation};
+use crate::client::{Client, Update, UpdateOp};
+use crate::edit_types::ViewEvent;
+use crate::find::{Find, FindStatus};
+use crate::line_cache_shadow::{self, LineCacheShadow, RenderPlan, RenderTactic};
+use crate::line_offset::LineOffset;
+use crate::linewrap::{InvalLines, Lines, VisualLine, WrapWidth};
+use crate::movement::{region_movement, selection_movement, Movement};
+use crate::plugins::PluginId;
+use crate::rpc::{FindQuery, GestureType, MouseAction, SelectionGranularity, SelectionModifier};
+use crate::selection::{Affinity, InsertDrift, SelRegion, Selection};
+use crate::styles::{Style, ThemeStyleMap};
+use crate::tabs::{BufferId, Counter, ViewId};
+use crate::width_cache::WidthCache;
+use crate::word_boundaries::WordCursor;
 use xi_rope::spans::Spans;
-use xi_rope::{Cursor, Interval, LinesMetric, Rope, RopeDelta, RopeInfo};
+use xi_rope::{Cursor, Interval, LinesMetric, Rope, RopeDelta};
 use xi_trace::trace_block;
 
 type StyleMap = RefCell<ThemeStyleMap>;
@@ -40,6 +43,11 @@ type StyleMap = RefCell<ThemeStyleMap>;
 /// A flag used to indicate when legacy actions should modify selections
 const FLAG_SELECT: u64 = 2;
 
+/// Size of batches as number of bytes used during incremental find.
+const FIND_BATCH_SIZE: usize = 500000;
+
+/// A view to a buffer. It is the buffer plus additional information
+/// like line breaks and selection state.
 pub struct View {
     view_id: ViewId,
     buffer_id: BufferId,
@@ -58,8 +66,7 @@ pub struct View {
     first_line: usize,
     /// height of visible portion
     height: usize,
-    breaks: Option<Breaks>,
-    wrap_col: WrapWidth,
+    lines: Lines,
 
     /// Front end's line cache state for this view. See the `LineCacheShadow`
     /// description for the invariant.
@@ -79,6 +86,9 @@ pub struct View {
     /// This is used to determined whether FindStatus should be sent to the frontend.
     find_changed: FindStatusChange,
 
+    /// Tracks the progress of incremental find.
+    find_progress: FindProgress,
+
     /// Tracks whether find highlights should be rendered.
     /// Highlights are only rendered when search dialog is open.
     highlight_find: bool,
@@ -88,6 +98,9 @@ pub struct View {
 
     /// Tracks whether the replacement string or replace parameters changed.
     replace_changed: bool,
+
+    /// Annotations provided by plugins.
+    annotations: AnnotationStore,
 }
 
 /// Indicates what changed in the find state.
@@ -101,6 +114,19 @@ enum FindStatusChange {
 
     /// Only number of matches changed
     Matches,
+}
+
+/// Indicates what changed in the find state.
+#[derive(PartialEq, Debug, Clone)]
+enum FindProgress {
+    /// Incremental find is done/not running.
+    Ready,
+
+    /// The find process just started.
+    Started,
+
+    /// Incremental find is in progress. Keeps tracked of already searched range.
+    InProgress(Range<usize>),
 }
 
 /// Contains replacement string and replace options.
@@ -118,37 +144,10 @@ pub struct Size {
     pub height: f64,
 }
 
-/// The visual width of the buffer for the purpose of word wrapping.
-enum WrapWidth {
-    /// No wrapping in effect.
-    None,
-
-    /// Width in bytes (utf-8 code units).
-    ///
-    /// Only works well for ASCII, will probably not be maintained long-term.
-    Bytes(usize),
-
-    /// Width in px units, requiring measurement by the front-end.
-    Width(f64),
-}
-
-/// The smallest unit of text that a gesture can select
-pub enum SelectionGranularity {
-    /// Selects any point or character range
-    Point,
-    /// Selects one word at a time
-    Word,
-    /// Selects one line at a time
-    Line,
-}
-
 /// State required to resolve a drag gesture into a selection.
 struct DragState {
     /// All the selection regions other than the one being dragged.
     base_sel: Selection,
-
-    /// Offset of the point where the drag started.
-    offset: usize,
 
     /// Start of the region selected when drag was started (region is
     /// assumed to be forward).
@@ -172,15 +171,16 @@ impl View {
             drag_state: None,
             first_line: 0,
             height: 10,
-            breaks: None,
-            wrap_col: WrapWidth::None,
+            lines: Lines::default(),
             lc_shadow: LineCacheShadow::default(),
             find: Vec::new(),
             find_id_counter: Counter::default(),
             find_changed: FindStatusChange::None,
+            find_progress: FindProgress::Ready,
             highlight_find: false,
             replace: None,
             replace_changed: false,
+            annotations: AnnotationStore::new(),
         }
     }
 
@@ -190,6 +190,10 @@ impl View {
 
     pub(crate) fn get_view_id(&self) -> ViewId {
         self.view_id
+    }
+
+    pub(crate) fn get_lines(&self) -> &Lines {
+        &self.lines
     }
 
     pub(crate) fn get_replace(&self) -> Option<Replace> {
@@ -204,6 +208,36 @@ impl View {
         self.pending_render
     }
 
+    pub(crate) fn update_wrap_settings(&mut self, text: &Rope, wrap_cols: usize, word_wrap: bool) {
+        let wrap_width = match (word_wrap, wrap_cols) {
+            (true, _) => WrapWidth::Width(self.size.width),
+            (false, 0) => WrapWidth::None,
+            (false, cols) => WrapWidth::Bytes(cols),
+        };
+        self.lines.set_wrap_width(text, wrap_width);
+    }
+
+    pub(crate) fn needs_more_wrap(&self) -> bool {
+        !self.lines.is_converged()
+    }
+
+    pub(crate) fn needs_wrap_in_visible_region(&self, text: &Rope) -> bool {
+        if self.lines.is_converged() {
+            false
+        } else {
+            let visible_region = self.interval_of_visible_region(text);
+            self.lines.interval_needs_wrap(visible_region)
+        }
+    }
+
+    pub(crate) fn find_in_progress(&self) -> bool {
+        match self.find_progress {
+            FindProgress::InProgress(_) => true,
+            FindProgress::Started => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn do_edit(&mut self, text: &Rope, cmd: ViewEvent) {
         use self::ViewEvent::*;
         match cmd {
@@ -216,11 +250,11 @@ impl View {
             Gesture { line, col, ty } => self.do_gesture(text, line, col, ty),
             GotoLine { line } => self.goto_line(text, line),
             Find { chars, case_sensitive, regex, whole_words } => {
-                let id = self.find.first().and_then(|q| Some(q.id()));
+                let id = self.find.first().map(|q| q.id());
                 let query_changes = FindQuery { id, chars, case_sensitive, regex, whole_words };
-                self.do_find(text, [query_changes].to_vec())
+                self.set_find(text, [query_changes].to_vec())
             }
-            MultiFind { queries } => self.do_find(text, queries),
+            MultiFind { queries } => self.set_find(text, queries),
             FindNext { wrap_around, allow_same, modify_selection } => {
                 self.do_find_next(text, false, wrap_around, allow_same, &modify_selection)
             }
@@ -233,7 +267,12 @@ impl View {
                 // should be removed in favor of do_gesture
                 warn!("Usage of click is deprecated; use do_gesture");
                 if (flags & FLAG_SELECT) != 0 {
-                    self.do_gesture(text, line, column, GestureType::RangeSelect)
+                    self.do_gesture(
+                        text,
+                        line,
+                        column,
+                        GestureType::SelectExtend { granularity: SelectionGranularity::Point },
+                    )
                 } else if click_count == Some(2) {
                     self.do_gesture(text, line, column, GestureType::WordSelect)
                 } else if click_count == Some(3) {
@@ -243,9 +282,10 @@ impl View {
                 }
             }
             Drag(MouseAction { line, column, .. }) => {
-                self.do_drag(text, line, column, Affinity::default())
+                warn!("Usage of drag is deprecated; use gesture instead");
+                self.do_gesture(text, line, column, GestureType::Drag)
             }
-            Cancel => self.do_cancel(text),
+            CollapseSelections => self.collapse_selections(text),
             HighlightFind { visible } => {
                 self.highlight_find = visible;
                 self.find_changed = FindStatusChange::All;
@@ -263,31 +303,18 @@ impl View {
         let col = col as usize;
         let offset = self.line_col_to_offset(text, line, col);
         match ty {
-            GestureType::PointSelect => {
-                self.set_selection(text, SelRegion::caret(offset));
-                self.start_drag(offset, offset, offset, SelectionGranularity::Point, false);
+            GestureType::Select { granularity, multi } => {
+                self.select(text, offset, granularity, multi)
             }
-            GestureType::RangeSelect => self.select_range(text, offset),
-            GestureType::ToggleSel => self.toggle_sel(text, offset),
-            GestureType::LineSelect => self.select_line(text, offset, line, false),
-            GestureType::WordSelect => self.select_word(text, offset, false),
-            GestureType::MultiLineSelect => self.select_line(text, offset, line, true),
-            GestureType::MultiWordSelect => self.select_word(text, offset, true),
-        }
-    }
+            GestureType::SelectExtend { granularity } => {
+                self.extend_selection(text, offset, granularity)
+            }
+            GestureType::Drag => self.do_drag(text, offset, Affinity::default()),
 
-    fn do_cancel(&mut self, text: &Rope) {
-        // if we have active find highlights, we don't collapse selections
-        if self.find.is_empty() {
-            self.collapse_selections(text);
-        } else {
-            self.unset_find();
+            _ => {
+                warn!("Deprecated gesture type sent to do_gesture method");
+            }
         }
-    }
-
-    pub(crate) fn unset_find(&mut self) {
-        self.find.iter_mut().for_each(Find::unset);
-        self.find.clear();
     }
 
     fn goto_line(&mut self, text: &Rope, line: u64) {
@@ -324,22 +351,19 @@ impl View {
         self.scroll_to = Some(end);
     }
 
-    /// Toggles a caret at the given offset.
-    pub fn toggle_sel(&mut self, text: &Rope, offset: usize) {
-        // We could probably reduce the cloning of selections by being clever.
-        let mut selection = self.selection.clone();
-        if !selection.regions_in_range(offset, offset).is_empty() {
-            selection.delete_range(offset, offset, true);
-            if !selection.is_empty() {
+    /// Removes any selection present at the given offset.
+    /// Returns true if a selection was removed, false otherwise.
+    pub fn deselect_at_offset(&mut self, text: &Rope, offset: usize) -> bool {
+        if !self.selection.regions_in_range(offset, offset).is_empty() {
+            let mut sel = self.selection.clone();
+            sel.delete_range(offset, offset, true);
+            if !sel.is_empty() {
                 self.drag_state = None;
-                self.set_selection_raw(text, selection);
-                return;
+                self.set_selection_raw(text, sel);
+                return true;
             }
         }
-        let region = SelRegion::caret(offset);
-        selection.add_region(region);
-        self.set_selection_raw(text, selection);
-        self.start_drag(offset, offset, offset, SelectionGranularity::Point, true)
+        false
     }
 
     /// Move the selection by the given movement. Return value is the offset of
@@ -349,7 +373,8 @@ impl View {
     /// of individual region movements become carets.
     pub fn do_move(&mut self, text: &Rope, movement: Movement, modify: bool) {
         self.drag_state = None;
-        let new_sel = selection_movement(movement, &self.selection, self, text, modify);
+        let new_sel =
+            selection_movement(movement, &self.selection, self, self.scroll_height(), text, modify);
         self.set_selection(text, new_sel);
     }
 
@@ -393,7 +418,8 @@ impl View {
         let mut sel = Selection::new();
         for &region in self.sel_regions() {
             sel.add_region(region);
-            let new_region = region_movement(movement, region, self, &text, false);
+            let new_region =
+                region_movement(movement, region, self, self.scroll_height(), &text, false);
             sel.add_region(new_region);
         }
         self.set_selection(text, sel);
@@ -409,6 +435,15 @@ impl View {
         self.lc_shadow.partial_invalidate(first_line, last_line, line_cache_shadow::STYLES_VALID);
     }
 
+    pub fn update_annotations(
+        &mut self,
+        plugin: PluginId,
+        interval: Interval,
+        annotations: Annotations,
+    ) {
+        self.annotations.update(plugin, interval, annotations)
+    }
+
     /// Select entire buffer.
     ///
     /// Note: unlike movement based selection, this does not scroll.
@@ -417,54 +452,85 @@ impl View {
         self.set_selection_raw(text, selection);
     }
 
-    /// Selects a specific range (eg. when the user performs SHIFT + click).
-    pub fn select_range(&mut self, text: &Rope, offset: usize) {
-        let sel = {
-            let (last, rest) = self.sel_regions().split_last().unwrap();
-            let mut sel = Selection::new();
-            for &region in rest {
-                sel.add_region(region);
+    /// Finds the unit of text containing the given offset.
+    fn unit(&self, text: &Rope, offset: usize, granularity: SelectionGranularity) -> Interval {
+        match granularity {
+            SelectionGranularity::Point => Interval::new(offset, offset),
+            SelectionGranularity::Word => {
+                let mut word_cursor = WordCursor::new(text, offset);
+                let (start, end) = word_cursor.select_word();
+                Interval::new(start, end)
             }
-            // TODO: small nit, merged region should be backward if end < start.
-            // This could be done by explicitly overriding, or by tweaking the
-            // merge logic.
-            sel.add_region(SelRegion::new(last.start, offset));
-            sel
-        };
-        let range_start = sel.last().unwrap().start;
-        self.set_selection(text, sel);
-        self.start_drag(range_start, range_start, range_start, SelectionGranularity::Point, false);
+            SelectionGranularity::Line => {
+                let (line, _) = self.offset_to_line_col(text, offset);
+                let (start, end) = self.lines.logical_line_range(text, line);
+                Interval::new(start, end)
+            }
+        }
     }
 
-    /// Selects the given region and supports multi selection.
-    fn select_region(&mut self, text: &Rope, region: SelRegion, multi_select: bool) {
-        let mut selection = match multi_select {
+    /// Selects text with a certain granularity and supports multi_selection
+    fn select(
+        &mut self,
+        text: &Rope,
+        offset: usize,
+        granularity: SelectionGranularity,
+        multi: bool,
+    ) {
+        // If multi-select is enabled, toggle existing regions
+        if multi
+            && granularity == SelectionGranularity::Point
+            && self.deselect_at_offset(text, offset)
+        {
+            return;
+        }
+
+        let region = self.unit(text, offset, granularity).into();
+
+        let base_sel = match multi {
             true => self.selection.clone(),
             false => Selection::new(),
         };
-
+        let mut selection = base_sel.clone();
         selection.add_region(region);
         self.set_selection(text, selection);
+
+        self.drag_state =
+            Some(DragState { base_sel, min: region.start, max: region.end, granularity });
     }
 
-    /// Selects an entire word and supports multi selection.
-    pub fn select_word(&mut self, text: &Rope, offset: usize, multi_select: bool) {
-        let (start, end) = {
-            let mut word_cursor = WordCursor::new(text, offset);
-            word_cursor.select_word()
+    /// Extends an existing selection (eg. when the user performs SHIFT + click).
+    pub fn extend_selection(
+        &mut self,
+        text: &Rope,
+        offset: usize,
+        granularity: SelectionGranularity,
+    ) {
+        if self.sel_regions().is_empty() {
+            return;
+        }
+
+        let (base_sel, last) = {
+            let mut base = Selection::new();
+            let (last, rest) = self.sel_regions().split_last().unwrap();
+            for &region in rest {
+                base.add_region(region);
+            }
+            (base, *last)
         };
 
-        self.select_region(text, SelRegion::new(start, end), multi_select);
-        self.start_drag(offset, start, end, SelectionGranularity::Word, multi_select);
-    }
+        let mut sel = base_sel.clone();
+        self.drag_state =
+            Some(DragState { base_sel, min: last.start, max: last.start, granularity });
 
-    /// Selects an entire line and supports multi selection.
-    pub fn select_line(&mut self, text: &Rope, offset: usize, line: usize, multi_select: bool) {
-        let start = self.line_col_to_offset(text, line, 0);
-        let end = self.line_col_to_offset(text, line + 1, 0);
+        let start = (last.start, last.start);
+        let new_region = self.range_region(text, start, offset, granularity);
 
-        self.select_region(text, SelRegion::new(start, end), multi_select);
-        self.start_drag(offset, start, end, SelectionGranularity::Line, multi_select);
+        // TODO: small nit, merged region should be backward if end < start.
+        // This could be done by explicitly overriding, or by tweaking the
+        // merge logic.
+        sel.add_region(new_region);
+        self.set_selection(text, sel);
     }
 
     /// Splits current selections into lines.
@@ -494,52 +560,37 @@ impl View {
         self.set_selection_raw(text, selection);
     }
 
-    /// Starts a drag operation.
-    pub fn start_drag(
-        &mut self,
-        offset: usize,
-        min: usize,
-        max: usize,
-        granularity: SelectionGranularity,
-        multi_select: bool,
-    ) {
-        let base_sel = match multi_select {
-            true => self.selection.clone(),
-            false => Selection::new(),
-        };
-        self.drag_state = Some(DragState { base_sel, offset, min, max, granularity });
-    }
-
     /// Does a drag gesture, setting the selection from a combination of the drag
     /// state and new offset.
-    fn do_drag(&mut self, text: &Rope, line: u64, col: u64, affinity: Affinity) {
-        let offset = self.line_col_to_offset(text, line as usize, col as usize);
+    fn do_drag(&mut self, text: &Rope, offset: usize, affinity: Affinity) {
         let new_sel = self.drag_state.as_ref().map(|drag_state| {
             let mut sel = drag_state.base_sel.clone();
-            // Determine which word or line the cursor is in
-            let (unit_start, unit_end) = match drag_state.granularity {
-                SelectionGranularity::Point => (offset, offset),
-                SelectionGranularity::Word => {
-                    let mut word_cursor = WordCursor::new(text, offset);
-                    word_cursor.select_word()
-                }
-                SelectionGranularity::Line => (
-                    self.line_col_to_offset(text, line as usize, 0),
-                    self.line_col_to_offset(text, (line as usize) + 1, 0),
-                ),
-            };
-            let (start, end) = if offset < drag_state.offset {
-                (drag_state.max, min(unit_start, drag_state.min))
-            } else {
-                (drag_state.min, max(unit_end, drag_state.max))
-            };
-            let horiz = None;
-            sel.add_region(SelRegion::new(start, end).with_horiz(horiz).with_affinity(affinity));
+            let start = (drag_state.min, drag_state.max);
+            let new_region = self.range_region(text, start, offset, drag_state.granularity);
+            sel.add_region(new_region.with_horiz(None).with_affinity(affinity));
             sel
         });
 
         if let Some(sel) = new_sel {
             self.set_selection(text, sel);
+        }
+    }
+
+    /// Creates a `SelRegion` for range select or drag operations.
+    pub fn range_region(
+        &self,
+        text: &Rope,
+        start: (usize, usize),
+        offset: usize,
+        granularity: SelectionGranularity,
+    ) -> SelRegion {
+        let (min_start, max_start) = start;
+        let end = self.unit(text, offset, granularity);
+        let (min_end, max_end) = (end.start, end.end);
+        if offset >= min_start {
+            SelRegion::new(min_start, max_end)
+        } else {
+            SelRegion::new(max_start, min_end)
         }
     }
 
@@ -561,38 +612,30 @@ impl View {
         !self.selection.regions_in_range(offset, offset).is_empty()
     }
 
-    // Render a single line, and advance cursors to next line.
-    fn render_line(
+    // Encode a single line with its styles and cursors in JSON.
+    // If "text" is not specified, don't add "text" to the output.
+    // If "style_spans" are not specified, don't add "styles" to the output.
+    fn encode_line(
         &self,
         client: &Client,
         styles: &StyleMap,
-        text: &Rope,
-        start_of_line: &mut Cursor<RopeInfo>,
-        soft_breaks: Option<&mut Cursor<BreaksInfo>>,
-        style_spans: &Spans<Style>,
-        line_num: usize,
+        line: VisualLine,
+        text: Option<&Rope>,
+        style_spans: Option<&Spans<Style>>,
+        last_pos: usize,
     ) -> Value {
-        let start_pos = start_of_line.pos();
-        let pos = soft_breaks
-            .map_or(start_of_line.next::<LinesMetric>(), |bc| {
-                let pos = bc.next::<BreaksMetric>();
-                // if using breaks update cursor
-                if let Some(pos) = pos {
-                    start_of_line.set(pos)
-                }
-                pos
-            }).unwrap_or(text.len());
-
-        let l_str = text.slice_to_cow(start_pos..pos);
+        let start_pos = line.interval.start;
+        let pos = line.interval.end;
         let mut cursors = Vec::new();
         let mut selections = Vec::new();
         for region in self.selection.regions_in_range(start_pos, pos) {
             // cursor
             let c = region.end;
+
             if (c > start_pos && c < pos)
                 || (!region.is_upstream() && c == start_pos)
                 || (region.is_upstream() && c == pos)
-                || (c == pos && c == text.len() && self.line_of_offset(text, c) == line_num)
+                || (c == pos && c == last_pos)
             {
                 cursors.push(c - start_pos);
             }
@@ -621,21 +664,32 @@ impl View {
             }
         }
 
-        let styles =
-            self.render_styles(client, styles, start_pos, pos, &selections, &hls, style_spans);
+        let mut result = json!({});
 
-        let mut result = json!({
-            "text": &l_str,
-            "styles": styles,
-        });
-
+        if let Some(text) = text {
+            result["text"] = json!(text.slice_to_cow(start_pos..pos));
+        }
+        if let Some(style_spans) = style_spans {
+            result["styles"] = json!(self.encode_styles(
+                client,
+                styles,
+                start_pos,
+                pos,
+                &selections,
+                &hls,
+                style_spans
+            ));
+        }
         if !cursors.is_empty() {
             result["cursor"] = json!(cursors);
+        }
+        if let Some(line_num) = line.line_num {
+            result["ln"] = json!(line_num);
         }
         result
     }
 
-    pub fn render_styles(
+    pub fn encode_styles(
         &self,
         client: &Client,
         styles: &StyleMap,
@@ -645,7 +699,8 @@ impl View {
         hls: &Vec<Vec<(usize, usize)>>,
         style_spans: &Spans<Style>,
     ) -> Vec<isize> {
-        let mut rendered_styles = Vec::new();
+        let mut encoded_styles = Vec::new();
+        assert!(start <= end, "{} {}", start, end);
         let style_spans = style_spans.subseq(Interval::new(start, end));
 
         let mut ix = 0;
@@ -654,26 +709,26 @@ impl View {
         // same span exists in both sets (as when there is an active selection)
         for (index, cur_find_hls) in hls.iter().enumerate() {
             for &(sel_start, sel_end) in cur_find_hls {
-                rendered_styles.push((sel_start as isize) - ix);
-                rendered_styles.push(sel_end as isize - sel_start as isize);
-                rendered_styles.push(index as isize + 1);
+                encoded_styles.push((sel_start as isize) - ix);
+                encoded_styles.push(sel_end as isize - sel_start as isize);
+                encoded_styles.push(index as isize + 1);
                 ix = sel_end as isize;
             }
         }
         for &(sel_start, sel_end) in sel {
-            rendered_styles.push((sel_start as isize) - ix);
-            rendered_styles.push(sel_end as isize - sel_start as isize);
-            rendered_styles.push(0);
+            encoded_styles.push((sel_start as isize) - ix);
+            encoded_styles.push(sel_end as isize - sel_start as isize);
+            encoded_styles.push(0);
             ix = sel_end as isize;
         }
         for (iv, style) in style_spans.iter() {
             let style_id = self.get_or_def_style_id(client, styles, &style);
-            rendered_styles.push((iv.start() as isize) - ix);
-            rendered_styles.push(iv.end() as isize - iv.start() as isize);
-            rendered_styles.push(style_id as isize);
+            encoded_styles.push((iv.start() as isize) - ix);
+            encoded_styles.push(iv.end() as isize - iv.start() as isize);
+            encoded_styles.push(style_id as isize);
             ix = iv.end() as isize;
         }
-        rendered_styles
+        encoded_styles
     }
 
     fn get_or_def_style_id(&self, client: &Client, style_map: &StyleMap, style: &Style) -> usize {
@@ -687,19 +742,6 @@ impl View {
         ix
     }
 
-    fn build_update_op(&self, op: &str, lines: Option<Vec<Value>>, n: usize) -> Value {
-        let mut update = json!({
-            "op": op,
-            "n": n,
-        });
-
-        if let Some(lines) = lines {
-            update["lines"] = json!(lines);
-        }
-
-        update
-    }
-
     fn send_update_for_plan(
         &mut self,
         text: &Rope,
@@ -709,7 +751,27 @@ impl View {
         plan: &RenderPlan,
         pristine: bool,
     ) {
+        // every time current visible range changes, annotations are sent to frontend
+        let start_off = self.offset_of_line(text, self.first_line);
+        let end_off = self.offset_of_line(text, self.first_line + self.height + 2);
+        let visible_range = Interval::new(start_off, end_off);
+        let selection_annotations =
+            self.selection.get_annotations(visible_range, &self, text).to_json();
+        let find_annotations =
+            self.find.iter().map(|ref f| f.get_annotations(visible_range, &self, text).to_json());
+        let plugin_annotations =
+            self.annotations.iter_range(&self, text, visible_range).map(|a| a.to_json());
+
+        let annotations = iter::once(selection_annotations)
+            .chain(find_annotations)
+            .chain(plugin_annotations)
+            .collect::<Vec<_>>();
+
         if !self.lc_shadow.needs_render(plan) {
+            let total_lines = self.line_of_offset(text, text.len()) + 1;
+            let update =
+                Update { ops: vec![UpdateOp::copy(total_lines, 1)], pristine, annotations };
+            client.update_view(self.view_id, &update);
             return;
         }
 
@@ -717,6 +779,7 @@ impl View {
         if self.find_changed != FindStatusChange::None {
             let matches_only = self.find_changed == FindStatusChange::Matches;
             client.find_status(self.view_id, &json!(self.find_status(text, matches_only)));
+            self.find_changed = FindStatusChange::None;
         }
 
         // send updated replace status if changed
@@ -733,79 +796,104 @@ impl View {
         for seg in self.lc_shadow.iter_with_plan(plan) {
             match seg.tactic {
                 RenderTactic::Discard => {
-                    ops.push(self.build_update_op("invalidate", None, seg.n));
+                    ops.push(UpdateOp::invalidate(seg.n));
                     b.add_span(seg.n, 0, 0);
                 }
-                RenderTactic::Preserve => {
-                    // TODO: in the case where it's ALL_VALID & !CURSOR_VALID, and cursors
-                    // are empty, could send update removing the cursor.
-                    if seg.validity == line_cache_shadow::ALL_VALID {
+                RenderTactic::Preserve | RenderTactic::Render => {
+                    // Depending on the state of TEXT_VALID, STYLES_VALID and
+                    // CURSOR_VALID, perform one of the following actions:
+                    //
+                    //   - All the three are valid => send the "copy" op
+                    //     (+leading "skip" to catch up with "ln" to update);
+                    //
+                    //   - Text and styles are valid, cursors are not => same,
+                    //     but send an "update" op instead of "copy" to move
+                    //     the cursors;
+                    //
+                    //   - Text or styles are invalid:
+                    //     => send "invalidate" if RenderTactic is "Preserve";
+                    //     => send "skip"+"insert" (recreate the lines) if
+                    //        RenderTactic is "Render".
+                    if (seg.validity & line_cache_shadow::TEXT_VALID) != 0
+                        && (seg.validity & line_cache_shadow::STYLES_VALID) != 0
+                    {
                         let n_skip = seg.their_line_num - line_num;
                         if n_skip > 0 {
-                            ops.push(self.build_update_op("skip", None, n_skip));
+                            ops.push(UpdateOp::skip(n_skip));
                         }
-                        ops.push(self.build_update_op("copy", None, seg.n));
-                        b.add_span(seg.n, seg.our_line_num, line_cache_shadow::ALL_VALID);
-                        line_num = seg.their_line_num + seg.n;
-                    } else {
-                        ops.push(self.build_update_op("invalidate", None, seg.n));
-                        b.add_span(seg.n, 0, 0);
-                    }
-                }
-                RenderTactic::Render => {
-                    // TODO: update (rather than re-render) in cases of text valid
-                    if seg.validity == line_cache_shadow::ALL_VALID {
-                        let n_skip = seg.their_line_num - line_num;
-                        if n_skip > 0 {
-                            ops.push(self.build_update_op("skip", None, n_skip));
-                        }
-                        ops.push(self.build_update_op("copy", None, seg.n));
-                        b.add_span(seg.n, seg.our_line_num, line_cache_shadow::ALL_VALID);
-                        line_num = seg.their_line_num + seg.n;
-                    } else {
-                        let start_line = seg.our_line_num;
-                        let end_line = start_line + seg.n;
+                        let line_offset = self.offset_of_line(text, seg.our_line_num);
+                        let logical_line = text.line_of_offset(line_offset);
+                        if (seg.validity & line_cache_shadow::CURSOR_VALID) != 0 {
+                            // ALL_VALID; copy lines as-is
+                            ops.push(UpdateOp::copy(seg.n, logical_line + 1));
+                        } else {
+                            // !CURSOR_VALID; update cursors
+                            let start_line = seg.our_line_num;
 
-                        let offset = self.offset_of_line(text, start_line);
-                        let mut line_cursor = Cursor::new(text, offset);
-                        let mut soft_breaks =
-                            self.breaks.as_ref().map(|breaks| Cursor::new(breaks, offset));
-                        let mut rendered_lines = Vec::new();
-                        for line_num in start_line..end_line {
-                            let line = self.render_line(
-                                client,
-                                styles,
-                                text,
-                                &mut line_cursor,
-                                soft_breaks.as_mut(),
-                                style_spans,
-                                line_num,
-                            );
-                            rendered_lines.push(line);
+                            let encoded_lines = self
+                                .lines
+                                .iter_lines(text, start_line)
+                                .take(seg.n)
+                                .map(|l| {
+                                    self.encode_line(
+                                        client,
+                                        styles,
+                                        l,
+                                        /* text = */ None,
+                                        /* style_spans = */ None,
+                                        text.len(),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+
+                            let logical_line_opt =
+                                if logical_line == 0 { None } else { Some(logical_line + 1) };
+                            ops.push(UpdateOp::update(encoded_lines, logical_line_opt));
                         }
-                        ops.push(self.build_update_op("ins", Some(rendered_lines), seg.n));
-                        b.add_span(seg.n, seg.our_line_num, line_cache_shadow::ALL_VALID);
+                        b.add_span(seg.n, seg.our_line_num, seg.validity);
+                        line_num = seg.their_line_num + seg.n;
+                    } else {
+                        if seg.tactic == RenderTactic::Preserve {
+                            ops.push(UpdateOp::invalidate(seg.n));
+                            b.add_span(seg.n, 0, 0);
+                        } else if seg.tactic == RenderTactic::Render {
+                            let start_line = seg.our_line_num;
+                            let encoded_lines = self
+                                .lines
+                                .iter_lines(text, start_line)
+                                .take(seg.n)
+                                .map(|l| {
+                                    self.encode_line(
+                                        client,
+                                        styles,
+                                        l,
+                                        Some(text),
+                                        Some(style_spans),
+                                        text.len(),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            debug_assert_eq!(encoded_lines.len(), seg.n);
+                            ops.push(UpdateOp::insert(encoded_lines));
+                            b.add_span(seg.n, seg.our_line_num, line_cache_shadow::ALL_VALID);
+                        }
                     }
                 }
             }
         }
-        let params = json!({
-            "ops": ops,
-            "pristine": pristine,
-        });
 
-        client.update_view(self.view_id, &params);
         self.lc_shadow = b.build();
         for find in &mut self.find {
             find.set_hls_dirty(false)
         }
+
+        let update = Update { ops, pristine, annotations };
+        client.update_view(self.view_id, &update);
     }
 
     /// Determines the current number of find results and search parameters to send them to
     /// the frontend.
-    pub fn find_status(&mut self, text: &Rope, matches_only: bool) -> Vec<FindStatus> {
-        self.find_changed = FindStatusChange::None;
-
+    pub fn find_status(&self, text: &Rope, matches_only: bool) -> Vec<FindStatus> {
         self.find
             .iter()
             .map(|find| find.find_status(&self, text, matches_only))
@@ -860,87 +948,28 @@ impl View {
         self.lc_shadow = b.build();
     }
 
-    // How should we count "column"? Valid choices include:
-    // * Unicode codepoints
-    // * grapheme clusters
-    // * Unicode width (so CJK counts as 2)
-    // * Actual measurement in text layout
-    // * Code units in some encoding
-    //
-    // Of course, all these are identical for ASCII. For now we use UTF-8 code units
-    // for simplicity.
-
-    pub(crate) fn offset_to_line_col(&self, text: &Rope, offset: usize) -> (usize, usize) {
-        let line = self.line_of_offset(text, offset);
-        (line, offset - self.offset_of_line(text, line))
+    /// Returns the byte range of the currently visible lines.
+    fn interval_of_visible_region(&self, text: &Rope) -> Interval {
+        let start = self.offset_of_line(text, self.first_line);
+        let end = self.offset_of_line(text, self.first_line + self.height + 1);
+        Interval::new(start, end)
     }
 
-    pub(crate) fn line_col_to_offset(&self, text: &Rope, line: usize, col: usize) -> usize {
-        let mut offset = self.offset_of_line(text, line).saturating_add(col);
-        if offset >= text.len() {
-            offset = text.len();
-            if self.line_of_offset(text, offset) <= line {
-                return offset;
-            }
-        } else {
-            // Snap to grapheme cluster boundary
-            offset = text.prev_grapheme_offset(offset + 1).unwrap();
-        }
-
-        // clamp to end of line
-        let next_line_offset = self.offset_of_line(text, line + 1);
-        if offset >= next_line_offset {
-            if let Some(prev) = text.prev_grapheme_offset(next_line_offset) {
-                offset = prev;
-            }
-        }
-        offset
-    }
-
-    // use own breaks if present, or text if not (no line wrapping)
-
-    /// Returns the visible line number containing the given offset.
-    pub fn line_of_offset(&self, text: &Rope, offset: usize) -> usize {
-        match self.breaks {
-            Some(ref breaks) => breaks.convert_metrics::<BreaksBaseMetric, BreaksMetric>(offset),
-            None => text.line_of_offset(offset),
-        }
-    }
-
-    /// Returns the byte offset corresponding to the line `line`.
-    pub fn offset_of_line(&self, text: &Rope, line: usize) -> usize {
-        match self.breaks {
-            Some(ref breaks) => breaks.convert_metrics::<BreaksMetric, BreaksBaseMetric>(line),
-            None => {
-                // sanitize input
-                let line = line.min(text.measure::<LinesMetric>() + 1);
-                text.offset_of_line(line)
-            }
-        }
-    }
-
-    pub(crate) fn rewrap(&mut self, text: &Rope, wrap_col: usize) {
-        if wrap_col > 0 {
-            self.breaks = Some(linewrap::linewrap(text, wrap_col));
-            self.wrap_col = WrapWidth::Bytes(wrap_col);
-        } else {
-            self.breaks = None
-        }
-    }
-
-    /// Generate line breaks based on width measurement. Currently batch-mode,
+    /// Generate line breaks, based on current settings. Currently batch-mode,
     /// and currently in a debugging state.
-    pub(crate) fn wrap_width(
+    pub(crate) fn rewrap(
         &mut self,
         text: &Rope,
         width_cache: &mut WidthCache,
         client: &Client,
-        style_spans: &Spans<Style>,
+        spans: &Spans<Style>,
     ) {
-        let _t = trace_block("View::wrap_width", &["core"]);
-        self.breaks =
-            Some(linewrap::linewrap_width(text, width_cache, style_spans, client, self.size.width));
-        self.wrap_col = WrapWidth::Width(self.size.width);
+        let _t = trace_block("View::rewrap", &["core"]);
+        let visible = self.first_line..self.first_line + self.height;
+        let inval = self.lines.rewrap_chunk(text, width_cache, client, spans, visible);
+        if let Some(InvalLines { start_line, inval_count, new_count }) = inval {
+            self.lc_shadow.edit(start_line, start_line + inval_count, new_count);
+        }
     }
 
     /// Updates the view after the text has been modified by the given `delta`.
@@ -955,36 +984,27 @@ impl View {
         width_cache: &mut WidthCache,
         drift: InsertDrift,
     ) {
-        let (iv, new_len) = delta.summary();
-        if let Some(breaks) = self.breaks.as_mut() {
-            match self.wrap_col {
-                WrapWidth::None => (),
-                WrapWidth::Bytes(col) => linewrap::rewrap(breaks, text, iv, new_len, col),
-                WrapWidth::Width(px) => {
-                    linewrap::rewrap_width(breaks, text, width_cache, client, iv, new_len, px)
-                }
+        let visible = self.first_line..self.first_line + self.height;
+        match self.lines.after_edit(text, last_text, delta, width_cache, client, visible) {
+            Some(InvalLines { start_line, inval_count, new_count }) => {
+                self.lc_shadow.edit(start_line, start_line + inval_count, new_count);
             }
+            None => self.set_dirty(text),
         }
-        if self.breaks.is_some() {
-            // TODO: finer grain invalidation for the line wrapping, needs info
-            // about what wrapped.
-            self.set_dirty(text);
-        } else {
-            let start = self.line_of_offset(last_text, iv.start());
-            let end = self.line_of_offset(last_text, iv.end()) + 1;
-            let new_end = self.line_of_offset(text, iv.start() + new_len) + 1;
-            self.lc_shadow.edit(start, end, new_end - start);
-        }
+
         // Any edit cancels a drag. This is good behavior for edits initiated through
         // the front-end, but perhaps not for async edits.
         self.drag_state = None;
 
+        // all annotations that come after the edit need to be invalidated
+        let (iv, _) = delta.summary();
+        self.annotations.invalidate(iv);
+
         // update only find highlights affected by change
         for find in &mut self.find {
             find.update_highlights(text, delta);
+            self.find_changed = FindStatusChange::All;
         }
-
-        self.find_changed = FindStatusChange::Matches;
 
         // Note: for committing plugin edits, we probably want to know the priority
         // of the delta so we can set the cursor before or after the edit, as needed.
@@ -1009,7 +1029,6 @@ impl View {
             _ => return,
         };
 
-        self.find_changed = FindStatusChange::All;
         self.set_dirty(text);
 
         // set selection as search query for first find if no additional search queries are used
@@ -1018,7 +1037,8 @@ impl View {
             self.add_find();
         }
 
-        self.find.last_mut().unwrap().do_find(text, &search_query, case_sensitive, false, true);
+        self.find.last_mut().unwrap().set_find(&search_query, case_sensitive, false, true);
+        self.find_progress = FindProgress::Started;
     }
 
     fn add_find(&mut self) {
@@ -1026,9 +1046,9 @@ impl View {
         self.find.push(Find::new(id));
     }
 
-    pub fn do_find(&mut self, text: &Rope, queries: Vec<FindQuery>) {
-        self.set_dirty(text);
-        self.find_changed = FindStatusChange::Matches;
+    fn set_find(&mut self, text: &Rope, queries: Vec<FindQuery>) {
+        // checks if at least query has been changed, otherwise we don't need to rerun find
+        let mut find_changed = queries.len() != self.find.len();
 
         // remove deleted queries
         self.find.retain(|f| queries.iter().any(|q| q.id == Some(f.id())));
@@ -1049,13 +1069,83 @@ impl View {
                 }
             };
 
-            self.find[pos].do_find(
-                text,
+            if self.find[pos].set_find(
                 &query.chars.clone(),
                 query.case_sensitive,
                 query.regex,
                 query.whole_words,
-            )
+            ) {
+                find_changed = true;
+            }
+        }
+
+        if find_changed {
+            self.set_dirty(text);
+            self.find_progress = FindProgress::Started;
+        }
+    }
+
+    pub fn do_find(&mut self, text: &Rope) {
+        let search_range = match &self.find_progress.clone() {
+            FindProgress::Started => {
+                // start incremental find on visible region
+                let start = self.offset_of_line(text, self.first_line);
+                let end = min(text.len(), start + FIND_BATCH_SIZE);
+                self.find_changed = FindStatusChange::Matches;
+                self.find_progress = FindProgress::InProgress(Range { start, end });
+                Some((start, end))
+            }
+            FindProgress::InProgress(searched_range) => {
+                if searched_range.start == 0 && searched_range.end >= text.len() {
+                    // the entire text has been searched
+                    // end find by executing multi-line regex queries on entire text
+                    // stop incremental find
+                    self.find_progress = FindProgress::Ready;
+                    self.find_changed = FindStatusChange::All;
+                    Some((0, text.len()))
+                } else {
+                    self.find_changed = FindStatusChange::Matches;
+                    // expand find to un-searched regions
+                    let start_off = self.offset_of_line(text, self.first_line);
+
+                    // If there is unsearched text before the visible region, we want to include it in this search operation
+                    let search_preceding_range = start_off.saturating_sub(searched_range.start)
+                        < searched_range.end.saturating_sub(start_off)
+                        && searched_range.start > 0;
+
+                    if search_preceding_range || searched_range.end >= text.len() {
+                        let start = searched_range.start.saturating_sub(FIND_BATCH_SIZE);
+                        self.find_progress =
+                            FindProgress::InProgress(Range { start, end: searched_range.end });
+                        Some((start, searched_range.start))
+                    } else if searched_range.end < text.len() {
+                        let end = min(text.len(), searched_range.end + FIND_BATCH_SIZE);
+                        self.find_progress =
+                            FindProgress::InProgress(Range { start: searched_range.start, end });
+                        Some((searched_range.end, end))
+                    } else {
+                        self.find_changed = FindStatusChange::All;
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.find_changed = FindStatusChange::None;
+                None
+            }
+        };
+
+        if let Some((search_range_start, search_range_end)) = search_range {
+            for query in &mut self.find {
+                if !query.is_multiline_regex() {
+                    query.update_find(text, search_range_start, search_range_end, true);
+                } else {
+                    // only execute multi-line regex queries if we are searching the entire text (last step)
+                    if search_range_start == 0 && search_range_end == text.len() {
+                        query.update_find(text, search_range_start, search_range_end, true);
+                    }
+                }
+            }
         }
     }
 
@@ -1172,17 +1262,6 @@ impl View {
         self.do_set_replace(replacement.into_owned(), false);
     }
 
-    /// Get the line range of a selected region.
-    pub fn get_line_range(&self, text: &Rope, region: &SelRegion) -> Range<usize> {
-        let (first_line, _) = self.offset_to_line_col(text, region.min());
-        let (mut last_line, last_col) = self.offset_to_line_col(text, region.max());
-        if last_col == 0 && last_line > first_line {
-            last_line -= 1;
-        }
-
-        first_line..(last_line + 1)
-    }
-
     pub fn get_caret_offset(&self) -> Option<usize> {
         match self.selection.len() {
             1 if self.selection[0].is_caret() => {
@@ -1194,6 +1273,30 @@ impl View {
     }
 }
 
+impl View {
+    /// Exposed for benchmarking
+    #[doc(hidden)]
+    pub fn debug_force_rewrap_cols(&mut self, text: &Rope, cols: usize) {
+        use xi_rpc::test_utils::DummyPeer;
+
+        let spans: Spans<Style> = Spans::default();
+        let mut width_cache = WidthCache::new();
+        let client = Client::new(Box::new(DummyPeer));
+        self.update_wrap_settings(text, cols, false);
+        self.rewrap(text, &mut width_cache, &client, &spans);
+    }
+}
+
+impl LineOffset for View {
+    fn offset_of_line(&self, text: &Rope, line: usize) -> usize {
+        self.lines.offset_of_visual_line(text, line)
+    }
+
+    fn line_of_offset(&self, text: &Rope, offset: usize) -> usize {
+        self.lines.visual_line_of_offset(text, offset)
+    }
+}
+
 // utility function to clamp a value within the given range
 fn clamp(x: usize, min: usize, max: usize) -> usize {
     if x < min {
@@ -1202,5 +1305,228 @@ fn clamp(x: usize, min: usize, max: usize) -> usize {
         x
     } else {
         max
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::FindQuery;
+
+    #[test]
+    fn incremental_find_update() {
+        let mut view = View::new(1.into(), BufferId::new(2));
+        let mut s = String::new();
+        for _ in 0..(FIND_BATCH_SIZE - 2) {
+            s += "x";
+        }
+        s += "aaaaaa";
+        for _ in 0..(FIND_BATCH_SIZE) {
+            s += "x";
+        }
+        s += "aaaaaa";
+        assert_eq!(view.find_in_progress(), false);
+
+        let text = Rope::from(&s);
+        view.do_edit(
+            &text,
+            ViewEvent::Find {
+                chars: "aaaaaa".to_string(),
+                case_sensitive: false,
+                regex: false,
+                whole_words: false,
+            },
+        );
+        view.do_find(&text);
+        assert_eq!(view.find_in_progress(), true);
+        view.do_find_all(&text);
+        assert_eq!(view.sel_regions().len(), 1);
+        assert_eq!(
+            view.sel_regions().first(),
+            Some(&SelRegion::new(FIND_BATCH_SIZE - 2, FIND_BATCH_SIZE + 6 - 2))
+        );
+        view.do_find(&text);
+        assert_eq!(view.find_in_progress(), true);
+        view.do_find_all(&text);
+        assert_eq!(view.sel_regions().len(), 2);
+    }
+
+    #[test]
+    fn incremental_find_codepoint_boundary() {
+        let mut view = View::new(1.into(), BufferId::new(2));
+        let mut s = String::new();
+        for _ in 0..(FIND_BATCH_SIZE + 2) {
+            s += "£€äßß";
+        }
+
+        assert_eq!(view.find_in_progress(), false);
+
+        let text = Rope::from(&s);
+        view.do_edit(
+            &text,
+            ViewEvent::Find {
+                chars: "a".to_string(),
+                case_sensitive: false,
+                regex: false,
+                whole_words: false,
+            },
+        );
+        view.do_find(&text);
+        assert_eq!(view.find_in_progress(), true);
+        view.do_find_all(&text);
+        assert_eq!(view.sel_regions().len(), 1); // cursor
+    }
+
+    #[test]
+    fn selection_for_find() {
+        let mut view = View::new(1.into(), BufferId::new(2));
+        let text = Rope::from("hello hello world\n");
+        view.set_selection(&text, SelRegion::new(6, 11));
+        view.do_edit(&text, ViewEvent::SelectionForFind { case_sensitive: false });
+        view.do_find(&text);
+        view.do_find_all(&text);
+        assert_eq!(view.sel_regions().len(), 2);
+    }
+
+    #[test]
+    fn find_next() {
+        let mut view = View::new(1.into(), BufferId::new(2));
+        let text = Rope::from("hello hello world\n");
+        view.do_edit(
+            &text,
+            ViewEvent::Find {
+                chars: "foo".to_string(),
+                case_sensitive: false,
+                regex: false,
+                whole_words: false,
+            },
+        );
+        view.do_find(&text);
+        view.do_find_next(&text, false, true, false, &SelectionModifier::Set);
+        assert_eq!(view.sel_regions().len(), 1);
+        assert_eq!(view.sel_regions().first(), Some(&SelRegion::new(0, 0))); // caret
+
+        view.do_edit(
+            &text,
+            ViewEvent::Find {
+                chars: "hello".to_string(),
+                case_sensitive: false,
+                regex: false,
+                whole_words: false,
+            },
+        );
+        view.do_find(&text);
+        assert_eq!(view.sel_regions().len(), 1);
+        view.do_find_next(&text, false, true, false, &SelectionModifier::Set);
+        assert_eq!(view.sel_regions().first(), Some(&SelRegion::new(0, 5)));
+        view.do_find_next(&text, false, true, false, &SelectionModifier::Set);
+        assert_eq!(view.sel_regions().first(), Some(&SelRegion::new(6, 11)));
+        view.do_find_next(&text, false, true, false, &SelectionModifier::Set);
+        assert_eq!(view.sel_regions().first(), Some(&SelRegion::new(0, 5)));
+        view.do_find_next(&text, true, true, false, &SelectionModifier::Set);
+        assert_eq!(view.sel_regions().first(), Some(&SelRegion::new(6, 11)));
+
+        view.do_find_next(&text, true, true, false, &SelectionModifier::Add);
+        assert_eq!(view.sel_regions().len(), 2);
+        view.do_find_next(&text, true, true, false, &SelectionModifier::AddRemovingCurrent);
+        assert_eq!(view.sel_regions().len(), 1);
+        view.do_find_next(&text, true, true, false, &SelectionModifier::None);
+        assert_eq!(view.sel_regions().len(), 1);
+    }
+
+    #[test]
+    fn find_all() {
+        let mut view = View::new(1.into(), BufferId::new(2));
+        let text = Rope::from("hello hello world\n hello!");
+        view.do_edit(
+            &text,
+            ViewEvent::Find {
+                chars: "foo".to_string(),
+                case_sensitive: false,
+                regex: false,
+                whole_words: false,
+            },
+        );
+        view.do_find(&text);
+        view.do_find_all(&text);
+        assert_eq!(view.sel_regions().len(), 1); // caret
+
+        view.do_edit(
+            &text,
+            ViewEvent::Find {
+                chars: "hello".to_string(),
+                case_sensitive: false,
+                regex: false,
+                whole_words: false,
+            },
+        );
+        view.do_find(&text);
+        view.do_find_all(&text);
+        assert_eq!(view.sel_regions().len(), 3);
+
+        view.do_edit(
+            &text,
+            ViewEvent::Find {
+                chars: "foo".to_string(),
+                case_sensitive: false,
+                regex: false,
+                whole_words: false,
+            },
+        );
+        view.do_find(&text);
+        view.do_find_all(&text);
+        assert_eq!(view.sel_regions().len(), 3);
+    }
+
+    #[test]
+    fn multi_queries_find_next() {
+        let mut view = View::new(1.into(), BufferId::new(2));
+        let text = Rope::from("hello hello world\n hello!");
+        let query1 = FindQuery {
+            id: None,
+            chars: "hello".to_string(),
+            case_sensitive: false,
+            regex: false,
+            whole_words: false,
+        };
+        let query2 = FindQuery {
+            id: None,
+            chars: "o world".to_string(),
+            case_sensitive: false,
+            regex: false,
+            whole_words: false,
+        };
+        view.do_edit(&text, ViewEvent::MultiFind { queries: vec![query1, query2] });
+        view.do_find(&text);
+        view.do_find_next(&text, false, true, false, &SelectionModifier::Set);
+        assert_eq!(view.sel_regions().first(), Some(&SelRegion::new(0, 5)));
+        view.do_find_next(&text, false, true, false, &SelectionModifier::Set);
+        assert_eq!(view.sel_regions().first(), Some(&SelRegion::new(6, 11)));
+        view.do_find_next(&text, false, true, false, &SelectionModifier::Set);
+        assert_eq!(view.sel_regions().first(), Some(&SelRegion::new(10, 17)));
+    }
+
+    #[test]
+    fn multi_queries_find_all() {
+        let mut view = View::new(1.into(), BufferId::new(2));
+        let text = Rope::from("hello hello world\n hello!");
+        let query1 = FindQuery {
+            id: None,
+            chars: "hello".to_string(),
+            case_sensitive: false,
+            regex: false,
+            whole_words: false,
+        };
+        let query2 = FindQuery {
+            id: None,
+            chars: "world".to_string(),
+            case_sensitive: false,
+            regex: false,
+            whole_words: false,
+        };
+        view.do_edit(&text, ViewEvent::MultiFind { queries: vec![query1, query2] });
+        view.do_find(&text);
+        view.do_find_all(&text);
+        assert_eq!(view.sel_regions().len(), 4);
     }
 }

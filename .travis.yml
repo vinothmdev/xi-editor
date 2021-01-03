@@ -2,13 +2,18 @@ language: rust
 osx_image: xcode9.2
 
 rust:
-  - 1.29.2
+  - stable
   - nightly
 
 os:
   - linux
   - osx
   - windows
+
+addons:
+  apt:
+    packages:
+      - libssl-dev
 
 matrix:
   allow_failures:
@@ -21,6 +26,11 @@ before_script:
   - rustup component add rustfmt-preview
   - rustup component add clippy-preview
 
+before_cache: |
+  if [[ "$TRAVIS_OS_NAME" == linux && "$TRAVIS_RUST_VERSION" == nightly ]]; then
+    RUSTFLAGS="--cfg procmacro2_semver_exempt" cargo install cargo-tarpaulin -f
+  fi
+
 # windows builds run in git bash so these (should) Just Work
 cache:
   directories:
@@ -32,5 +42,12 @@ script:
   - export RUST_BACKTRACE=1
   - RUSTFLAGS="-D warnings" cargo check --all || exit
   - cargo test --all || exit
-  - if [ "$TRAVIS_RUST_VERSION" = '1.29.2' ]; then cargo fmt --all -- --check; fi
-  - if [ "$TRAVIS_RUST_VERSION" = '1.29.2' ]; then cargo clippy --all -- -D warnings; fi
+  - if [ "$TRAVIS_RUST_VERSION" = 'stable' ]; then cargo fmt --all -- --check; fi
+  - if [ "$TRAVIS_RUST_VERSION" = 'stable' ]; then cargo clippy --all -- -D warnings; fi
+
+after_success: |
+  if [[ "$TRAVIS_OS_NAME" == linux && "$TRAVIS_RUST_VERSION" == nightly ]]; then
+    cd ..
+    cargo tarpaulin -r rust -v --all --out Xml
+    bash <(curl -s https://codecov.io/bash)
+  fi

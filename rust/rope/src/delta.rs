@@ -16,13 +16,13 @@
 //! It's useful to explicitly represent these operations so they can be
 //! shared across multiple subsystems.
 
-use interval::{Interval, IntervalBounds};
-use multiset::{CountMatcher, Subset, SubsetBuilder};
+use crate::interval::{Interval, IntervalBounds};
+use crate::multiset::{CountMatcher, Subset, SubsetBuilder};
+use crate::tree::{Node, NodeInfo, TreeBuilder};
 use std::cmp::min;
 use std::fmt;
 use std::ops::Deref;
 use std::slice;
-use tree::{Node, NodeInfo, TreeBuilder};
 
 #[derive(Clone)]
 pub enum DeltaElement<N: NodeInfo> {
@@ -53,10 +53,10 @@ pub struct InsertDelta<N: NodeInfo>(Delta<N>);
 impl<N: NodeInfo> Delta<N> {
     pub fn simple_edit<T: IntervalBounds>(interval: T, rope: Node<N>, base_len: usize) -> Delta<N> {
         let mut builder = Builder::new(base_len);
-        if rope.len() > 0 {
-            builder.replace(interval, rope);
-        } else {
+        if rope.is_empty() {
             builder.delete(interval);
+        } else {
+            builder.replace(interval, rope);
         }
         builder.build()
     }
@@ -89,10 +89,13 @@ impl<N: NodeInfo> Delta<N> {
     }
 
     /// Returns `true` if this delta represents a single deletion without
-    /// any insertions. Note that this is `false` for the trivial delta.
+    /// any insertions.
+    ///
+    /// Note that this is `false` for the trivial delta, as well as for a deletion
+    /// from an empty `Rope`.
     pub fn is_simple_delete(&self) -> bool {
-        if self.els.is_empty() && self.base_len > 0 {
-            return true;
+        if self.els.is_empty() {
+            return self.base_len > 0;
         }
         if let DeltaElement::Copy(beg, end) = self.els[0] {
             if beg == 0 {
@@ -116,13 +119,16 @@ impl<N: NodeInfo> Delta<N> {
 
     /// Returns `true` if applying the delta will cause no change.
     pub fn is_identity(&self) -> bool {
-        if self.els.len() == 1 {
+        let len = self.els.len();
+        // Case 1: Everything from beginning to end is getting copied.
+        if len == 1 {
             if let DeltaElement::Copy(beg, end) = self.els[0] {
                 return beg == 0 && end == self.base_len;
             }
         }
 
-        false
+        // Case 2: The rope is empty and the entire rope is getting deleted.
+        len == 0 && self.base_len == 0
     }
 
     /// Apply the delta to the given rope. May not work well if the length of the rope
@@ -207,6 +213,9 @@ impl<N: NodeInfo> Delta<N> {
     ///     assert_eq!(String::from(d2.apply(r)), String::from(d.apply(r)));
     /// }
     /// ```
+    // For if last_old.is_some() && last_old.unwrap().0 <= beg {. Clippy complaints
+    // about not using if-let, but that'd change the meaning of the conditional.
+    #[allow(clippy::unnecessary_unwrap)]
     pub fn synthesize(tombstones: &Node<N>, from_dels: &Subset, to_dels: &Subset) -> Delta<N> {
         let base_len = from_dels.len_after_delete();
         let mut els = Vec::new();
@@ -376,6 +385,7 @@ where
 }
 
 impl<N: NodeInfo> InsertDelta<N> {
+    #![allow(clippy::many_single_char_names)]
     /// Do a coordinate transformation on an insert-only delta. The `after` parameter
     /// controls whether the insertions in `self` come after those specific in the
     /// coordinate transform.
@@ -453,7 +463,8 @@ impl<N: NodeInfo> InsertDelta<N> {
                     DeltaElement::Copy(m.doc_index_to_subset(b), m.doc_index_to_subset(e))
                 }
                 DeltaElement::Insert(ref n) => DeltaElement::Insert(n.clone()),
-            }).collect();
+            })
+            .collect();
         InsertDelta(Delta { els, base_len: xform.len_after_delete() })
     }
 
@@ -591,7 +602,7 @@ impl<N: NodeInfo> Builder<N> {
     /// is not properly sorted.
     pub fn replace<T: IntervalBounds>(&mut self, interval: T, rope: Node<N>) {
         self.delete(interval);
-        if rope.len() > 0 {
+        if !rope.is_empty() {
             self.delta.els.push(DeltaElement::Insert(rope));
         }
     }
@@ -692,11 +703,10 @@ impl<'a, N: NodeInfo> Iterator for DeletionsIter<'a, N> {
 
 #[cfg(test)]
 mod tests {
-    use delta::{Builder, Delta, DeltaElement, DeltaRegion};
-    use interval::Interval;
-    use rope::{Rope, RopeInfo};
-    use serde_json;
-    use test_helpers::find_deletions;
+    use crate::delta::{Builder, Delta, DeltaElement, DeltaRegion};
+    use crate::interval::Interval;
+    use crate::rope::{Rope, RopeInfo};
+    use crate::test_helpers::find_deletions;
 
     const TEST_STR: &'static str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -821,17 +831,11 @@ mod tests {
     }
 
     #[test]
-    fn delta_serde() {
-        let d = Delta::simple_edit(Interval::new(10, 12), Rope::from("+"), TEST_STR.len());
-        let ser = serde_json::to_value(d.clone()).expect("serialize failed");
-        eprintln!("{:?}", &ser);
-        let de: Delta<RopeInfo> = serde_json::from_value(ser).expect("deserialize failed");
-        assert_eq!(d.apply_to_string(TEST_STR), de.apply_to_string(TEST_STR));
-    }
-
-    #[test]
     fn is_simple_delete() {
         let d = Delta::simple_edit(10..12, Rope::from("+"), TEST_STR.len());
+        assert_eq!(false, d.is_simple_delete());
+
+        let d = Delta::simple_edit(Interval::new(0, 0), Rope::from(""), 0);
         assert_eq!(false, d.is_simple_delete());
 
         let d = Delta::simple_edit(Interval::new(10, 11), Rope::from(""), TEST_STR.len());
@@ -866,6 +870,9 @@ mod tests {
 
         let d = Delta::simple_edit(0..0, Rope::from(""), TEST_STR.len());
         assert_eq!(true, d.is_identity());
+
+        let d = Delta::simple_edit(0..0, Rope::from(""), 0);
+        assert_eq!(true, d.is_identity());
     }
 
     #[test]
@@ -875,5 +882,23 @@ mod tests {
 
         let d = Delta::simple_edit(Interval::new(10, 10), Rope::from("+"), TEST_STR.len());
         assert_eq!(Some(Rope::from("+")).as_ref(), d.as_simple_insert());
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use crate::rope::{Rope, RopeInfo};
+    use crate::{Delta, Interval};
+    use serde_json;
+
+    const TEST_STR: &'static str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    #[test]
+    fn delta_serde() {
+        let d = Delta::simple_edit(Interval::new(10, 12), Rope::from("+"), TEST_STR.len());
+        let ser = serde_json::to_value(d.clone()).expect("serialize failed");
+        eprintln!("{:?}", &ser);
+        let de: Delta<RopeInfo> = serde_json::from_value(ser).expect("deserialize failed");
+        assert_eq!(d.apply_to_string(TEST_STR), de.apply_to_string(TEST_STR));
     }
 }

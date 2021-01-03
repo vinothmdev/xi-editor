@@ -14,10 +14,11 @@
 
 //! A general b-tree structure suitable for ropes and the like.
 
-use std::cmp::min;
+use std::cmp::{min, Ordering};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
-use interval::{Interval, IntervalBounds};
+use crate::interval::{Interval, IntervalBounds};
 
 const MIN_CHILDREN: usize = 4;
 const MAX_CHILDREN: usize = 8;
@@ -41,7 +42,7 @@ pub trait NodeInfo: Clone {
     /// deriving the info from the concatenation of the two leaves. In
     /// mathematical terms, the compute_info method is a monoid
     /// homomorphism.
-    fn compute_info(&Self::L) -> Self;
+    fn compute_info(_: &Self::L) -> Self;
 
     /// The identity of the monoid. Need not be implemented because it
     /// can be computed from the leaf default.
@@ -57,6 +58,15 @@ pub trait NodeInfo: Clone {
     fn interval(&self, len: usize) -> Interval {
         Interval::new(0, len)
     }
+}
+
+/// A trait indicating the default metric of a NodeInfo.
+///
+/// Adds quality of life functions to
+/// Node\<N\>, where N is a DefaultMetric.
+/// For example, [Node\<DefaultMetric\>.count](struct.Node.html#method.count).
+pub trait DefaultMetric: NodeInfo {
+    type DefaultMetric: Metric<Self>;
 }
 
 /// A trait for the leaves of trees of type [Node](struct.Node.html).
@@ -192,11 +202,22 @@ impl<N: NodeInfo> Node<N> {
         Node(Arc::new(NodeBody { height: 0, len, info, val: NodeVal::Leaf(l) }))
     }
 
+    /// Create a node from a vec of nodes.
+    ///
+    /// The input must satisfy the following balancing requirements:
+    /// * The length of `nodes` must be <= MAX_CHILDREN and > 1.
+    /// * All the nodes are the same height.
+    /// * All the nodes must satisfy is_ok_child.
     fn from_nodes(nodes: Vec<Node<N>>) -> Node<N> {
+        debug_assert!(nodes.len() > 1);
+        debug_assert!(nodes.len() <= MAX_CHILDREN);
         let height = nodes[0].0.height + 1;
         let mut len = nodes[0].0.len;
         let mut info = nodes[0].0.info.clone();
+        debug_assert!(nodes[0].is_ok_child());
         for child in &nodes[1..] {
+            debug_assert_eq!(child.height() + 1, height);
+            debug_assert!(child.is_ok_child());
             len += child.0.len;
             info.accumulate(&child.0.info);
         }
@@ -205,6 +226,18 @@ impl<N: NodeInfo> Node<N> {
 
     pub fn len(&self) -> usize {
         self.0.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns `true` if these two `Node`s share the same underlying data.
+    ///
+    /// This is principally intended to be used by the druid crate, without needing
+    /// to actually add a feature and implement druid's `Data` trait.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     fn height(&self) -> usize {
@@ -227,28 +260,27 @@ impl<N: NodeInfo> Node<N> {
         }
     }
 
-    /// Returns the first child with a positive measure, starting from the
-    /// `j`th.  Also, returns the length in base units of the children we have
-    /// skipped. Note that if it returns `None` in the first component, we skip
-    /// all the children.
-    fn next_positive_measure_child<M: Metric<N>>(&self, j: usize) -> (Option<usize>, usize) {
-        let children = self.get_children();
-        let mut offset = 0;
-        for i in j..children.len() {
-            if children[i].measure::<M>() > 0 {
-                return (Some(i), offset);
-            } else {
-                offset += children[i].len();
-            }
-        }
-        (None, offset)
-    }
-
     fn get_leaf(&self) -> &N::L {
         if let NodeVal::Leaf(ref l) = self.0.val {
             l
         } else {
             panic!("get_leaf called on internal node");
+        }
+    }
+
+    /// Call a callback with a mutable reference to a leaf.
+    ///
+    /// This clones the leaf if the reference is shared. It also recomputes
+    /// length and info after the leaf is mutated.
+    fn with_leaf_mut<T>(&mut self, f: impl FnOnce(&mut N::L) -> T) -> T {
+        let inner = Arc::make_mut(&mut self.0);
+        if let NodeVal::Leaf(ref mut l) = inner.val {
+            let result = f(l);
+            inner.len = l.len();
+            inner.info = N::compute_info(l);
+            result
+        } else {
+            panic!("with_leaf_mut called on internal node");
         }
     }
 
@@ -300,8 +332,6 @@ impl<N: NodeInfo> Node<N> {
     }
 
     pub fn concat(rope1: Node<N>, rope2: Node<N>) -> Node<N> {
-        use std::cmp::Ordering;
-
         let h1 = rope1.height();
         let h2 = rope2.height();
 
@@ -371,7 +401,6 @@ impl<N: NodeInfo> Node<N> {
                     child.push_subseq(b, rec_iv);
                     offset += child.len();
                 }
-                return;
             }
         }
     }
@@ -426,92 +455,203 @@ impl<N: NodeInfo> Node<N> {
     }
 }
 
+impl<N: DefaultMetric> Node<N> {
+    /// Measures the length of the text bounded by ``DefaultMetric::measure(offset)`` with another metric.
+    ///
+    /// # Examples
+    /// ```
+    /// use crate::xi_rope::{Rope, LinesMetric};
+    ///
+    /// // the default metric of Rope is BaseMetric (aka number of bytes)
+    /// let my_rope = Rope::from("first line \n second line \n");
+    ///
+    /// // count the number of lines in my_rope
+    /// let num_lines = my_rope.count::<LinesMetric>(my_rope.len());
+    /// assert_eq!(2, num_lines);
+    /// ```
+    pub fn count<M: Metric<N>>(&self, offset: usize) -> usize {
+        self.convert_metrics::<N::DefaultMetric, M>(offset)
+    }
+
+    /// Measures the length of the text bounded by ``M::measure(offset)`` with the default metric.
+    ///
+    /// # Examples
+    /// ```
+    /// use crate::xi_rope::{Rope, LinesMetric};
+    ///
+    /// // the default metric of Rope is BaseMetric (aka number of bytes)
+    /// let my_rope = Rope::from("first line \n second line \n");
+    ///
+    /// // get the byte offset of the line at index 1
+    /// let byte_offset = my_rope.count_base_units::<LinesMetric>(1);
+    /// assert_eq!(12, byte_offset);
+    /// ```
+    pub fn count_base_units<M: Metric<N>>(&self, offset: usize) -> usize {
+        self.convert_metrics::<M, N::DefaultMetric>(offset)
+    }
+}
+
 impl<N: NodeInfo> Default for Node<N> {
     fn default() -> Node<N> {
         Node::from_leaf(N::L::default())
     }
 }
 
-pub struct TreeBuilder<N: NodeInfo>(Option<Node<N>>);
+/// A builder for creating new trees.
+pub struct TreeBuilder<N: NodeInfo> {
+    // A stack of partially built trees. These are kept in order of
+    // strictly descending height, and all vectors have a length less
+    // than MAX_CHILDREN and greater than zero.
+    //
+    // In addition, there is a balancing invariant: for each vector
+    // of length greater than one, all elements satisfy `is_ok_child`.
+    stack: Vec<Vec<Node<N>>>,
+}
 
 impl<N: NodeInfo> TreeBuilder<N> {
+    /// A new, empty builder.
     pub fn new() -> TreeBuilder<N> {
-        TreeBuilder(None)
+        TreeBuilder { stack: Vec::new() }
     }
 
-    /// Push a node on the accumulating tree by concatenating it.
-    ///
-    /// This method is O(log n), where `n` is the amount of nodes already in the accumulating tree.
-    /// The worst case happens when all nodes having exactly MAX_CHILDREN children
-    /// and the node being pushed is a leaf or equivalently has height 1.
-    /// Then `log n` nodes have to be created before the leaf can be added, to keep all leaves on the same height.
-    pub fn push(&mut self, n: Node<N>) {
-        match self.0.take() {
-            None => self.0 = Some(n),
-            Some(buf) => self.0 = Some(Node::concat(buf, n)),
-        }
-    }
-
-    /// Add leaves to accumulating tree.
-    ///
-    /// Creates a stack of node lists, where all the nodes in a list have uniform node height.
-    /// The stack is height sorted in ascending order.
-    /// The length of any list in the stack is at most MAX_CHILDREN -1.
-    ///
-    /// Example of this kind of stack if MAX_CHILDREN = 3:
-    /// let n_i be some node of height i. Let the front of the array represent the top of the stack.
-    /// `[[n_1, n_1], [n_2], [n_3, n_3]]`
-    ///
-    /// The nodes in the stack are pushed on the accumulating tree one by one in the end.
-    pub fn push_leaves(&mut self, leaves: Vec<N::L>) {
-        let mut stack: Vec<Vec<Node<N>>> = Vec::new();
-        for leaf in leaves {
-            let mut new = Node::from_leaf(leaf);
-            loop {
-                if stack.last().map_or(true, |r| r[0].height() != new.height()) {
-                    stack.push(Vec::new());
+    /// Append a node to the tree being built.
+    pub fn push(&mut self, mut n: Node<N>) {
+        loop {
+            let ord = if let Some(last) = self.stack.last() {
+                last[0].height().cmp(&n.height())
+            } else {
+                Ordering::Greater
+            };
+            match ord {
+                Ordering::Less => {
+                    n = Node::concat(self.pop(), n);
                 }
-                stack.last_mut().unwrap().push(new);
-                if stack.last().unwrap().len() < MAX_CHILDREN {
+                Ordering::Equal => {
+                    let tos = self.stack.last_mut().unwrap();
+                    if tos.last().unwrap().is_ok_child() && n.is_ok_child() {
+                        tos.push(n);
+                    } else if n.height() == 0 {
+                        let iv = Interval::new(0, n.len());
+                        let new_leaf = tos
+                            .last_mut()
+                            .unwrap()
+                            .with_leaf_mut(|l| l.push_maybe_split(n.get_leaf(), iv));
+                        if let Some(new_leaf) = new_leaf {
+                            tos.push(Node::from_leaf(new_leaf));
+                        }
+                    } else {
+                        let last = tos.pop().unwrap();
+                        let children1 = last.get_children();
+                        let children2 = n.get_children();
+                        let n_children = children1.len() + children2.len();
+                        if n_children <= MAX_CHILDREN {
+                            tos.push(Node::from_nodes([children1, children2].concat()));
+                        } else {
+                            // Note: this leans left. Splitting at midpoint is also an option
+                            let splitpoint = min(MAX_CHILDREN, n_children - MIN_CHILDREN);
+                            let mut iter = children1.iter().chain(children2.iter()).cloned();
+                            let left = iter.by_ref().take(splitpoint).collect();
+                            let right = iter.collect();
+                            tos.push(Node::from_nodes(left));
+                            tos.push(Node::from_nodes(right));
+                        }
+                    }
+                    if tos.len() < MAX_CHILDREN {
+                        break;
+                    }
+                    n = self.pop()
+                }
+                Ordering::Greater => {
+                    self.stack.push(vec![n]);
                     break;
                 }
-                new = Node::from_nodes(stack.pop().unwrap())
-            }
-        }
-        for v in stack {
-            for r in v {
-                self.push(r)
             }
         }
     }
 
+    /// Append a sequence of leaves.
+    pub fn push_leaves(&mut self, leaves: impl IntoIterator<Item = N::L>) {
+        for leaf in leaves.into_iter() {
+            self.push(Node::from_leaf(leaf));
+        }
+    }
+
+    /// Append a single leaf.
     pub fn push_leaf(&mut self, l: N::L) {
         self.push(Node::from_leaf(l))
     }
 
+    /// Append a slice of a single leaf.
     pub fn push_leaf_slice(&mut self, l: &N::L, iv: Interval) {
         self.push(Node::from_leaf(l.subseq(iv)))
     }
 
-    pub fn build(self) -> Node<N> {
-        match self.0 {
-            Some(r) => r,
-            None => Node::from_leaf(N::L::default()),
+    /// Build the final tree.
+    ///
+    /// The tree is the concatenation of all the nodes and leaves that have been pushed
+    /// on the builder, in order.
+    pub fn build(mut self) -> Node<N> {
+        if self.stack.is_empty() {
+            Node::from_leaf(N::L::default())
+        } else {
+            let mut n = self.pop();
+            while !self.stack.is_empty() {
+                n = Node::concat(self.pop(), n);
+            }
+            n
+        }
+    }
+
+    /// Pop the last vec-of-nodes off the stack, resulting in a node.
+    fn pop(&mut self) -> Node<N> {
+        let nodes = self.stack.pop().unwrap();
+        if nodes.len() == 1 {
+            nodes.into_iter().next().unwrap()
+        } else {
+            Node::from_nodes(nodes)
         }
     }
 }
 
 const CURSOR_CACHE_SIZE: usize = 4;
 
+/// A data structure for traversing boundaries in a tree.
+///
+/// It is designed to be efficient both for random access and for iteration. The
+/// cursor itself is agnostic to which [`Metric`] is used to determine boundaries, but
+/// the methods to find boundaries are parametrized on the [`Metric`].
+///
+/// A cursor can be valid or invalid. It is always valid when created or after
+/// [`set`](#method.set) is called, and becomes invalid after [`prev`](#method.prev)
+/// or [`next`](#method.next) fails to find a boundary.
+///
+/// [`Metric`]: struct.Metric.html
 pub struct Cursor<'a, N: 'a + NodeInfo> {
+    /// The tree being traversed by this cursor.
     root: &'a Node<N>,
+    /// The current position of the cursor.
+    ///
+    /// It is always less than or equal to the tree length.
     position: usize,
+    /// The cache holds the tail of the path from the root to the current leaf.
+    ///
+    /// Each entry is a reference to the parent node and the index of the child. It
+    /// is stored bottom-up; `cache[0]` is the parent of the leaf and the index of
+    /// the leaf within that parent.
+    ///
+    /// The main motivation for this being a fixed-size array is to keep the cursor
+    /// an allocation-free data structure.
     cache: [Option<(&'a Node<N>, usize)>; CURSOR_CACHE_SIZE],
+    /// The leaf containing the current position, when the cursor is valid.
+    ///
+    /// The position is only at the end of the leaf when it is at the end of the tree.
     leaf: Option<&'a N::L>,
+    /// The offset of `leaf` within the tree.
     offset_of_leaf: usize,
 }
 
 impl<'a, N: NodeInfo> Cursor<'a, N> {
+    /// Create a new cursor at the given position.
     pub fn new(n: &'a Node<N>, position: usize) -> Cursor<'a, N> {
         let mut result = Cursor {
             root: n,
@@ -524,17 +664,30 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
         result
     }
 
+    /// The length of the tree.
     pub fn total_len(&self) -> usize {
         self.root.len()
     }
 
-    /// return value is leaf (if cursor is valid) and offset within leaf
+    /// Return a reference to the root node of the tree.
+    pub fn root(&self) -> &'a Node<N> {
+        self.root
+    }
+
+    /// Get the current leaf of the cursor.
     ///
-    /// invariant: offset is at end of leaf iff end of rope
+    /// If the cursor is valid, returns the leaf containing the current position,
+    /// and the offset of the current position within the leaf. That offset is equal
+    /// to the leaf length only at the end, otherwise it is less than the leaf length.
     pub fn get_leaf(&self) -> Option<(&'a N::L, usize)> {
         self.leaf.map(|l| (l, self.position - self.offset_of_leaf))
     }
 
+    /// Set the position of the cursor.
+    ///
+    /// The cursor is valid after this call.
+    ///
+    /// Precondition: `position` is less than or equal to the length of the tree.
     pub fn set(&mut self, position: usize) {
         self.position = position;
         if let Some(l) = self.leaf {
@@ -547,84 +700,78 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
         self.descend();
     }
 
+    /// Get the position of the cursor.
     pub fn pos(&self) -> usize {
         self.position
     }
 
+    /// Determine whether the current position is a boundary.
+    ///
+    /// Note: the beginning and end of the tree may or may not be boundaries, depending on the
+    /// metric. If the metric is not `can_fragment`, then they always are.
     pub fn is_boundary<M: Metric<N>>(&mut self) -> bool {
         if self.leaf.is_none() {
             // not at a valid position
             return false;
         }
-        if self.position == 0 || (self.position == self.offset_of_leaf && !M::can_fragment()) {
+        if self.position == self.offset_of_leaf && !M::can_fragment() {
             return true;
         }
-        if self.position > self.offset_of_leaf {
+        if self.position == 0 || self.position > self.offset_of_leaf {
             return M::is_boundary(self.leaf.unwrap(), self.position - self.offset_of_leaf);
         }
         // tricky case, at beginning of leaf, need to query end of previous
         // leaf; TODO: would be nice if we could do it another way that didn't
-        // make the method &self mut.
+        // make the method &mut self.
         let l = self.prev_leaf().unwrap().0;
         let result = M::is_boundary(l, l.len());
         let _ = self.next_leaf();
         result
     }
 
-    /// Moves the cursor to the previous boundary, or to the beginning of the
-    /// rope. In the former case, returns the position of the first character
-    /// past this boundary. In the latter case, returns `0`.
-    pub fn prev<M: Metric<N>>(&mut self) -> Option<(usize)> {
+    /// Moves the cursor to the previous boundary.
+    ///
+    /// When there is no previous boundary, returns `None` and the cursor becomes invalid.
+    ///
+    /// Return value: the position of the boundary, if it exists.
+    pub fn prev<M: Metric<N>>(&mut self) -> Option<usize> {
         if self.position == 0 || self.leaf.is_none() {
             self.leaf = None;
             return None;
         }
         let orig_pos = self.position;
         let offset_in_leaf = orig_pos - self.offset_of_leaf;
-        if let Some(l) = self.leaf {
-            if offset_in_leaf > 0 {
-                if let Some(offset_in_leaf) = M::prev(l, offset_in_leaf) {
-                    self.position = self.offset_of_leaf + offset_in_leaf;
-                    return Some(self.position);
-                }
-            }
-        } else {
-            panic!("inconsistent, shouldn't get here");
-        }
-        // not in same leaf, need to scan backwards
-        // TODO: walk up tree to skip measure-0 nodes
-        loop {
-            if self.offset_of_leaf == 0 {
-                self.position = 0;
+        if offset_in_leaf > 0 {
+            let l = self.leaf.unwrap();
+            if let Some(offset_in_leaf) = M::prev(l, offset_in_leaf) {
+                self.position = self.offset_of_leaf + offset_in_leaf;
                 return Some(self.position);
             }
-            if let Some((l, _)) = self.prev_leaf() {
-                // TODO: node already has this, no need to recompute. But, we
-                // should be looking at nodes anyway at this point, as we need
-                // to walk up the tree.
-                let node_info = N::compute_info(l);
-                if M::measure(&node_info, l.len()) == 0 {
-                    // leaf doesn't contain boundary, keep scanning
-                    continue;
-                }
-                if self.offset_of_leaf + l.len() < orig_pos && M::is_boundary(l, l.len()) {
-                    let _ = self.next_leaf();
-                    return Some(self.position);
-                }
-                if let Some(offset_in_leaf) = M::prev(l, l.len()) {
-                    self.position = self.offset_of_leaf + offset_in_leaf;
-                    return Some(self.position);
-                } else {
-                    panic!("metric is inconsistent, metric > 0 but no boundary");
-                }
-            }
         }
+
+        // not in same leaf, need to scan backwards
+        self.prev_leaf()?;
+        if let Some(offset) = self.last_inside_leaf::<M>(orig_pos) {
+            return Some(offset);
+        }
+
+        // Not found in previous leaf, find using measurement.
+        let measure = self.measure_leaf::<M>(self.position);
+        if measure == 0 {
+            self.leaf = None;
+            self.position = 0;
+            return None;
+        }
+        self.descend_metric::<M>(measure);
+        self.last_inside_leaf::<M>(orig_pos)
     }
 
-    /// Moves the cursor to the next boundary, or to the end of the rope. In the
-    /// former case, returns the position of the first character past this
-    /// boundary. In the latter case, returns the length of the rope.
-    pub fn next<M: Metric<N>>(&mut self) -> Option<(usize)> {
+    /// Moves the cursor to the next boundary.
+    ///
+    /// When there is no next boundary, returns `None` and the cursor becomes invalid.
+    ///
+    /// Return value: the position of the boundary, if it exists.
+    pub fn next<M: Metric<N>>(&mut self) -> Option<usize> {
         if self.position >= self.root.len() || self.leaf.is_none() {
             self.leaf = None;
             return None;
@@ -634,74 +781,103 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
             return Some(offset);
         }
 
-        if let Some(l) = self.leaf {
-            self.position = self.offset_of_leaf + l.len();
-            for i in 0..CURSOR_CACHE_SIZE {
-                if self.cache[i].is_none() {
-                    // we are at the root of the tree.
-                    return Some(self.root.len());
-                }
-                let (node, j) = self.cache[i].unwrap();
-                let (next_j, offset) = node.next_positive_measure_child::<M>(j + 1);
-                self.position += offset;
-                if let Some(next_j) = next_j {
-                    self.cache[i] = Some((node, next_j));
-                    let mut node_down = &node.get_children()[next_j];
-                    for k in (0..i).rev() {
-                        let (pm_child, offset) = node_down.next_positive_measure_child::<M>(0);
-                        let pm_child = pm_child.unwrap(); // at least one child must have positive measure
-                        self.position += offset;
-                        self.cache[k] = Some((node_down, pm_child));
-                        node_down = &node_down.get_children()[pm_child];
-                    }
-                    self.leaf = Some(node_down.get_leaf());
-                    self.offset_of_leaf = self.position;
-                    return self.next_inside_leaf::<M>();
-                }
-            }
-            // At this point, we know that (1) the next boundary is not not in
-            // the cached subtree, (2) self.position corresponds to the begining
-            // of the first leaf after the cached subtree.
-            self.descend();
-            return self.next::<M>();
-        } else {
-            panic!("inconsistent, shouldn't get here");
+        self.next_leaf()?;
+        if let Some(offset) = self.next_inside_leaf::<M>() {
+            return Some(offset);
         }
-    }
 
-    /// Tries to find the next boundary in the leaf the cursor is currently in.
-    #[inline(always)]
-    fn next_inside_leaf<M: Metric<N>>(&mut self) -> Option<usize> {
-        if let Some(l) = self.leaf {
-            let offset_in_leaf = self.position - self.offset_of_leaf;
-            if let Some(offset_in_leaf) = M::next(l, offset_in_leaf) {
-                if offset_in_leaf == l.len()
-                    && self.offset_of_leaf + offset_in_leaf != self.root.len()
-                {
-                    let _ = self.next_leaf();
-                } else {
-                    self.position = self.offset_of_leaf + offset_in_leaf;
-                }
-                return Some(self.position);
-            }
-            if self.offset_of_leaf + l.len() == self.root.len() {
-                self.position = self.root.len();
-                return Some(self.position);
-            }
-        } else {
-            panic!("inconsistent, shouldn't get here");
+        // Leaf is 0-measure (otherwise would have already succeeded).
+        let measure = self.measure_leaf::<M>(self.position);
+        self.descend_metric::<M>(measure + 1);
+        if let Some(offset) = self.next_inside_leaf::<M>() {
+            return Some(offset);
         }
+
+        // Not found, properly invalidate cursor.
+        self.position = self.root.len();
+        self.leaf = None;
         None
     }
 
-    /// same return as get_leaf, moves to beginning of next leaf
-    pub fn next_leaf(&mut self) -> Option<(&'a N::L, usize)> {
-        if let Some(leaf) = self.leaf {
-            self.position = self.offset_of_leaf + leaf.len();
+    /// Returns the current position if it is a boundary in this [`Metric`],
+    /// else behaves like [`next`](#method.next).
+    ///
+    /// [`Metric`]: struct.Metric.html
+    pub fn at_or_next<M: Metric<N>>(&mut self) -> Option<usize> {
+        if self.is_boundary::<M>() {
+            Some(self.pos())
         } else {
-            self.leaf = None;
-            return None;
+            self.next::<M>()
         }
+    }
+
+    /// Returns the current position if it is a boundary in this [`Metric`],
+    /// else behaves like [`prev`](#method.prev).
+    ///
+    /// [`Metric`]: struct.Metric.html
+    pub fn at_or_prev<M: Metric<N>>(&mut self) -> Option<usize> {
+        if self.is_boundary::<M>() {
+            Some(self.pos())
+        } else {
+            self.prev::<M>()
+        }
+    }
+
+    /// Returns an iterator with this cursor over the given [`Metric`].
+    ///
+    /// # Examples:
+    ///
+    /// ```
+    /// # use xi_rope::{Cursor, LinesMetric, Rope};
+    /// #
+    /// let text: Rope = "one line\ntwo line\nred line\nblue".into();
+    /// let mut cursor = Cursor::new(&text, 0);
+    /// let line_offsets = cursor.iter::<LinesMetric>().collect::<Vec<_>>();
+    /// assert_eq!(line_offsets, vec![9, 18, 27]);
+    ///
+    /// ```
+    /// [`Metric`]: struct.Metric.html
+    pub fn iter<'c, M: Metric<N>>(&'c mut self) -> CursorIter<'c, 'a, N, M> {
+        CursorIter { cursor: self, _metric: PhantomData }
+    }
+
+    /// Tries to find the last boundary in the leaf the cursor is currently in.
+    ///
+    /// If the last boundary is at the end of the leaf, it is only counted if
+    /// it is less than `orig_pos`.
+    #[inline]
+    fn last_inside_leaf<M: Metric<N>>(&mut self, orig_pos: usize) -> Option<usize> {
+        let l = self.leaf.expect("inconsistent, shouldn't get here");
+        let len = l.len();
+        if self.offset_of_leaf + len < orig_pos && M::is_boundary(l, len) {
+            let _ = self.next_leaf();
+            return Some(self.position);
+        }
+        let offset_in_leaf = M::prev(l, len)?;
+        self.position = self.offset_of_leaf + offset_in_leaf;
+        Some(self.position)
+    }
+
+    /// Tries to find the next boundary in the leaf the cursor is currently in.
+    #[inline]
+    fn next_inside_leaf<M: Metric<N>>(&mut self) -> Option<usize> {
+        let l = self.leaf.expect("inconsistent, shouldn't get here");
+        let offset_in_leaf = self.position - self.offset_of_leaf;
+        let offset_in_leaf = M::next(l, offset_in_leaf)?;
+        if offset_in_leaf == l.len() && self.offset_of_leaf + offset_in_leaf != self.root.len() {
+            let _ = self.next_leaf();
+        } else {
+            self.position = self.offset_of_leaf + offset_in_leaf;
+        }
+        Some(self.position)
+    }
+
+    /// Move to beginning of next leaf.
+    ///
+    /// Return value: same as [`get_leaf`](#method.get_leaf).
+    pub fn next_leaf(&mut self) -> Option<(&'a N::L, usize)> {
+        let leaf = self.leaf?;
+        self.position = self.offset_of_leaf + leaf.len();
         for i in 0..CURSOR_CACHE_SIZE {
             if self.cache[i].is_none() {
                 // this probably can't happen
@@ -729,14 +905,18 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
         self.get_leaf()
     }
 
-    /// same return as get_leaf, moves to beginning of prev leaf
+    /// Move to beginning of previous leaf.
+    ///
+    /// Return value: same as [`get_leaf`](#method.get_leaf).
     pub fn prev_leaf(&mut self) -> Option<(&'a N::L, usize)> {
-        if self.offset_of_leaf == 0 || Some(self.leaf).is_none() {
+        if self.offset_of_leaf == 0 {
             self.leaf = None;
+            self.position = 0;
             return None;
         }
         for i in 0..CURSOR_CACHE_SIZE {
             if self.cache[i].is_none() {
+                // this probably can't happen
                 self.leaf = None;
                 return None;
             }
@@ -762,6 +942,10 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
         self.get_leaf()
     }
 
+    /// Go to the leaf containing the current position.
+    ///
+    /// Sets `leaf` to the leaf containing `position`, and updates `cache` and
+    /// `offset_of_leaf` to be consistent.
     fn descend(&mut self) {
         let mut node = self.root;
         let mut offset = 0;
@@ -788,12 +972,96 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
         self.leaf = Some(node.get_leaf());
         self.offset_of_leaf = offset;
     }
+
+    /// Returns the measure at the beginning of the leaf containing `pos`.
+    ///
+    /// This method is O(log n) no matter the current cursor state.
+    fn measure_leaf<M: Metric<N>>(&self, mut pos: usize) -> usize {
+        let mut node = self.root;
+        let mut metric = 0;
+        while node.height() > 0 {
+            for child in node.get_children() {
+                let len = child.len();
+                if pos < len {
+                    node = child;
+                    break;
+                }
+                pos -= len;
+                metric += child.measure::<M>();
+            }
+        }
+        metric
+    }
+
+    /// Find the leaf having the given measure.
+    ///
+    /// This function sets `self.position` to the beginning of the leaf
+    /// containing the smallest offset with the given metric, and also updates
+    /// state as if [`descend`](#method.descend) was called.
+    ///
+    /// If `measure` is greater than the measure of the whole tree, then moves
+    /// to the last node.
+    fn descend_metric<M: Metric<N>>(&mut self, mut measure: usize) {
+        let mut node = self.root;
+        let mut offset = 0;
+        while node.height() > 0 {
+            let children = node.get_children();
+            let mut i = 0;
+            loop {
+                if i + 1 == children.len() {
+                    break;
+                }
+                let child = &children[i];
+                let child_m = child.measure::<M>();
+                if child_m >= measure {
+                    break;
+                }
+                offset += child.len();
+                measure -= child_m;
+                i += 1;
+            }
+            let cache_ix = node.height() - 1;
+            if cache_ix < CURSOR_CACHE_SIZE {
+                self.cache[cache_ix] = Some((node, i));
+            }
+            node = &children[i];
+        }
+        self.leaf = Some(node.get_leaf());
+        self.position = offset;
+        self.offset_of_leaf = offset;
+    }
+}
+
+/// An iterator generated by a [`Cursor`], for some [`Metric`].
+///
+/// [`Cursor`]: struct.Cursor.html
+/// [`Metric`]: struct.Metric.html
+pub struct CursorIter<'c, 'a: 'c, N: 'a + NodeInfo, M: 'a + Metric<N>> {
+    cursor: &'c mut Cursor<'a, N>,
+    _metric: PhantomData<&'a M>,
+}
+
+impl<'c, 'a, N: NodeInfo, M: Metric<N>> Iterator for CursorIter<'c, 'a, N, M> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        self.cursor.next::<M>()
+    }
+}
+
+impl<'c, 'a, N: NodeInfo, M: Metric<N>> CursorIter<'c, 'a, N, M> {
+    /// Returns the current position of the underlying [`Cursor`].
+    ///
+    /// [`Cursor`]: struct.Cursor.html
+    pub fn pos(&self) -> usize {
+        self.cursor.pos()
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use rope::*;
+    use crate::rope::*;
 
     fn build_triangle(n: u32) -> String {
         let mut s = String::new();
@@ -807,16 +1075,20 @@ mod test {
     }
 
     #[test]
-    fn eq_rope_with_stack() {
+    fn eq_rope_with_pieces() {
         let n = 2_000;
         let s = build_triangle(n);
         let mut builder_default = TreeBuilder::new();
-        let mut builder_stacked = TreeBuilder::new();
+        let mut concat_rope = Rope::default();
         builder_default.push_str(&s);
-        builder_stacked.push_str_stacked(&s);
-        let tree_default = builder_default.build();
-        let tree_stacked = builder_stacked.build();
-        assert_eq!(tree_default, tree_stacked);
+        let mut i = 0;
+        while i < s.len() {
+            let j = (i + 1000).min(s.len());
+            concat_rope = concat_rope + s[i..j].into();
+            i = j;
+        }
+        let built_rope = builder_default.build();
+        assert_eq!(built_rope, concat_rope);
     }
 
     #[test]
@@ -835,11 +1107,31 @@ mod test {
     }
 
     #[test]
+    fn node_is_empty() {
+        let text = Rope::from(String::new());
+        assert_eq!(text.is_empty(), true);
+    }
+
+    #[test]
     fn cursor_next_empty() {
         let text = Rope::from(String::new());
         let mut cursor = Cursor::new(&text, 0);
         assert_eq!(cursor.next::<LinesMetric>(), None);
         assert_eq!(cursor.pos(), 0);
+    }
+
+    #[test]
+    fn cursor_iter() {
+        let text: Rope = build_triangle(50).into();
+        let mut cursor = Cursor::new(&text, 0);
+        let mut manual = Vec::new();
+        while let Some(nxt) = cursor.next::<LinesMetric>() {
+            manual.push(nxt);
+        }
+
+        cursor.set(0);
+        let auto = cursor.iter::<LinesMetric>().collect::<Vec<_>>();
+        assert_eq!(manual, auto);
     }
 
     #[test]
@@ -862,6 +1154,13 @@ mod test {
             if pos < s.len() {
                 assert!(it.is_some(), "must be Some(_)");
                 assert!(s.as_bytes()[pos - 1] == b'\n', "not a linebreak");
+            } else {
+                if s.as_bytes()[s.len() - 1] == b'\n' {
+                    assert!(it.is_some(), "must be Some(_)");
+                } else {
+                    assert!(it.is_none());
+                    assert!(c.get_leaf().is_none());
+                }
             }
         }
     }
@@ -869,6 +1168,7 @@ mod test {
     #[test]
     fn cursor_prev_misc() {
         cursor_prev_for("toto");
+        cursor_prev_for("a\na\n");
         cursor_prev_for("toto\n");
         cursor_prev_for("toto\ntata");
         cursor_prev_for("歴史\n科学的");
@@ -882,7 +1182,12 @@ mod test {
             let mut c = Cursor::new(&r, i);
             let it = c.prev::<LinesMetric>();
             let pos = c.pos();
-            assert!(s.as_bytes()[pos..i].iter().all(|c| *c != b'\n'), "missed linebreak");
+
+            //Should countain at most one linebreak
+            assert!(
+                s.as_bytes()[pos..i].iter().filter(|c| **c == b'\n').count() <= 1,
+                "missed linebreak"
+            );
 
             if i == 0 && s.as_bytes()[i] == b'\n' {
                 assert_eq!(pos, 0);
@@ -895,4 +1200,79 @@ mod test {
         }
     }
 
+    #[test]
+    fn at_or_next() {
+        let text: Rope = "this\nis\nalil\nstring".into();
+        let mut cursor = Cursor::new(&text, 0);
+        assert_eq!(cursor.at_or_next::<LinesMetric>(), Some(5));
+        assert_eq!(cursor.at_or_next::<LinesMetric>(), Some(5));
+        cursor.set(1);
+        assert_eq!(cursor.at_or_next::<LinesMetric>(), Some(5));
+        assert_eq!(cursor.at_or_prev::<LinesMetric>(), Some(5));
+        cursor.set(6);
+        assert_eq!(cursor.at_or_prev::<LinesMetric>(), Some(5));
+        cursor.set(6);
+        assert_eq!(cursor.at_or_next::<LinesMetric>(), Some(8));
+        assert_eq!(cursor.at_or_next::<LinesMetric>(), Some(8));
+    }
+
+    #[test]
+    fn next_zero_measure_large() {
+        let mut text = Rope::from("a");
+        for _ in 0..24 {
+            text = Node::concat(text.clone(), text);
+            let mut cursor = Cursor::new(&text, 0);
+            assert_eq!(cursor.next::<LinesMetric>(), None);
+            // Test that cursor is properly invalidated and at end of text.
+            assert_eq!(cursor.get_leaf(), None);
+            assert_eq!(cursor.pos(), text.len());
+
+            cursor.set(text.len());
+            assert_eq!(cursor.prev::<LinesMetric>(), None);
+            // Test that cursor is properly invalidated and at beginning of text.
+            assert_eq!(cursor.get_leaf(), None);
+            assert_eq!(cursor.pos(), 0);
+        }
+    }
+
+    #[test]
+    fn prev_line_large() {
+        let s: String = format!("{}{}", "\n", build_triangle(1000));
+        let rope = Rope::from(s);
+        let mut expected_pos = rope.len();
+        let mut cursor = Cursor::new(&rope, rope.len());
+
+        for i in (1..1001).rev() {
+            expected_pos = expected_pos - i;
+            assert_eq!(expected_pos, cursor.prev::<LinesMetric>().unwrap());
+        }
+
+        assert_eq!(None, cursor.prev::<LinesMetric>());
+    }
+
+    #[test]
+    fn prev_line_small() {
+        let empty_rope = Rope::from("\n");
+        let mut cursor = Cursor::new(&empty_rope, empty_rope.len());
+        assert_eq!(None, cursor.prev::<LinesMetric>());
+
+        let rope = Rope::from("\n\n\n\n\n\n\n\n\n\n");
+        cursor = Cursor::new(&rope, rope.len());
+        let mut expected_pos = rope.len();
+        for _ in (1..10).rev() {
+            expected_pos -= 1;
+            assert_eq!(expected_pos, cursor.prev::<LinesMetric>().unwrap());
+        }
+
+        assert_eq!(None, cursor.prev::<LinesMetric>());
+    }
+
+    #[test]
+    fn balance_invariant() {
+        let mut tb = TreeBuilder::<RopeInfo>::new();
+        let leaves: Vec<String> = (0..1000).map(|i| i.to_string().into()).collect();
+        tb.push_leaves(leaves);
+        let tree = tb.build();
+        println!("height {}", tree.height());
+    }
 }

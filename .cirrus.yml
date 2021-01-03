@@ -7,7 +7,7 @@ task:
       matrix:
         - name: test (linux)
           container:
-            image: rust:1.29.2
+            image: rust:latest
             cpu: 4
             memory: 8G
           rustfmt_script: rustup component add rustfmt-preview && cd rust && cargo fmt --all -- --check
@@ -23,10 +23,10 @@ task:
         image: high-sierra-xcode-9.4.1
       env:
         PATH: $PATH:$CARGO_HOME/bin
-      install_cmake_script: brew install cmake
+      install_cmake_script: brew install cmake || brew upgrade cmake
       matrix:
         - name: test (macOS)
-          install_rust_script: curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain 1.29.2
+          install_rust_script: curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
           rustfmt_script: rustup component add rustfmt-preview && cd rust && cargo fmt --all -- --check
           clippy_script: rustup component add clippy-preview && cd rust && cargo clippy --all -- -D warnings
         - name: test (macOS nightly)

@@ -16,12 +16,11 @@
 //!
 //! Clients can store multiple, named recordings.
 
+use std::collections::HashMap;
+
 use xi_trace::trace_block;
 
-use std::collections::HashMap;
-use std::mem;
-
-use edit_types::{BufferEvent, EventDomain};
+use crate::edit_types::{BufferEvent, EventDomain};
 
 /// A container that manages and holds all recordings for the current editing session
 pub(crate) struct Recorder {
@@ -74,7 +73,7 @@ impl Recorder {
             _ => {}
         }
 
-        mem::replace(&mut self.active_recording, recording_name);
+        self.active_recording = recording_name;
     }
 
     /// Saves an event into the currently active recording.
@@ -110,7 +109,7 @@ impl Recorder {
     /// on each event.
     pub(crate) fn play<F>(&self, recording_name: &str, action: F)
     where
-        F: FnMut(&EventDomain) -> (),
+        F: FnMut(&EventDomain),
     {
         let is_current_recording: bool = self
             .active_recording
@@ -122,10 +121,9 @@ impl Recorder {
             return;
         }
 
-        self.recordings.get(recording_name).and_then(|recording| {
+        if let Some(recording) = self.recordings.get(recording_name) {
             recording.play(action);
-            Some(())
-        });
+        }
     }
 
     /// Completely removes the specified recording from the Recorder
@@ -171,7 +169,8 @@ impl Recorder {
                 }
 
                 true
-            }).collect::<Vec<EventDomain>>()
+            })
+            .collect::<Vec<EventDomain>>()
             .into_iter()
             .rev()
             .collect();
@@ -195,7 +194,7 @@ impl Recording {
     /// on each event.
     fn play<F>(&self, action: F)
     where
-        F: FnMut(&EventDomain) -> (),
+        F: FnMut(&EventDomain),
     {
         let _guard = trace_block("Recording::play", &["core", "recording"]);
         self.events.iter().for_each(action)
@@ -209,8 +208,8 @@ impl Recording {
 // R = Redo
 #[cfg(test)]
 mod tests {
-    use edit_types::{BufferEvent, EventDomain};
-    use recorder::Recorder;
+    use crate::edit_types::{BufferEvent, EventDomain};
+    use crate::recorder::Recorder;
 
     #[test]
     fn play_recording() {

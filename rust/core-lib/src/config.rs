@@ -20,12 +20,11 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::de::Deserialize;
+use serde::de::{self, Deserialize};
 use serde_json::{self, Value};
-use toml;
 
-use syntax::{LanguageId, Languages};
-use tabs::{BufferId, ViewId};
+use crate::syntax::{LanguageId, Languages};
+use crate::tabs::{BufferId, ViewId};
 
 /// Loads the included base config settings.
 fn load_base_config() -> Table {
@@ -155,10 +154,26 @@ pub struct Config<T> {
     pub items: T,
 }
 
+fn deserialize_tab_size<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let tab_size = usize::deserialize(deserializer)?;
+    if tab_size == 0 {
+        Err(de::Error::invalid_value(
+            de::Unexpected::Unsigned(tab_size as u64),
+            &"tab_size must be at least 1",
+        ))
+    } else {
+        Ok(tab_size)
+    }
+}
+
 /// The concrete type for buffer-related settings.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct BufferItems {
     pub line_ending: String,
+    #[serde(deserialize_with = "deserialize_tab_size")]
     pub tab_size: usize,
     pub translate_tabs_to_spaces: bool,
     pub use_tab_stops: bool,
@@ -170,6 +185,7 @@ pub struct BufferItems {
     pub word_wrap: bool,
     pub autodetect_whitespace: bool,
     pub surrounding_pairs: Vec<(String, String)>,
+    pub save_with_newline: bool,
 }
 
 pub type BufferConfig = Config<BufferItems>;
@@ -268,7 +284,8 @@ impl ConfigManager {
     ///
     /// Panics if `id` already exists.
     pub(crate) fn add_buffer(&mut self, id: BufferId, path: Option<&Path>) -> Table {
-        let lang = path.and_then(|p| self.language_for_path(p)).unwrap_or_default();
+        let lang =
+            path.and_then(|p| self.language_for_path(p)).unwrap_or(LanguageId::from("Plain Text"));
         let lang_tag = LanguageTag::new(lang);
         assert!(self.buffer_tags.insert(id, lang_tag).is_none());
         self.update_buffer_config(id).expect("new buffer must always have config")
@@ -447,10 +464,7 @@ impl ConfigManager {
         config: Table,
     ) -> Result<Vec<(BufferId, Table)>, ConfigError> {
         self.check_table(&config)?;
-        self.configs
-            .entry(domain.clone())
-            .or_insert_with(|| ConfigPair::with_base(None))
-            .set_table(config);
+        self.configs.entry(domain).or_insert_with(|| ConfigPair::with_base(None)).set_table(config);
         Ok(self.update_all_buffer_configs())
     }
 
@@ -475,7 +489,7 @@ impl ConfigManager {
     /// from disk.
     pub(crate) fn table_for_update(&mut self, domain: ConfigDomain, changes: Table) -> Table {
         self.configs
-            .entry(domain.clone())
+            .entry(domain)
             .or_insert_with(|| ConfigPair::with_base(None))
             .table_for_update(changes)
     }
@@ -521,6 +535,22 @@ impl ConfigManager {
         let themes_dir = self.config_dir.as_ref().map(|p| p.join("themes"));
 
         if let Some(p) = themes_dir {
+            if p.exists() {
+                return Some(p);
+            }
+            if fs::DirBuilder::new().create(&p).is_ok() {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// Path to plugins sub directory inside config directory.
+    /// Creates one if not present.
+    pub(crate) fn get_plugins_dir(&self) -> Option<PathBuf> {
+        let plugins_dir = self.config_dir.as_ref().map(|p| p.join("plugins"));
+
+        if let Some(p) = plugins_dir {
             if p.exists() {
                 return Some(p);
             }
@@ -663,25 +693,15 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::ConfigError::*;
         match *self {
-            UnknownDomain(ref s) => write!(f, "{}: {}", self.description(), s),
-            Parse(ref p, ref e) => write!(f, "{} ({:?}), {:?}", self.description(), p, e),
-            Io(ref e) => write!(f, "error loading config: {:?}", e),
+            UnknownDomain(ref s) => write!(f, "UnknownDomain: {}", s),
+            Parse(ref p, ref e) => write!(f, "Parse ({:?}), {}", p, e),
+            Io(ref e) => write!(f, "error loading config: {}", e),
             UnexpectedItem(ref e) => write!(f, "{}", e),
         }
     }
 }
 
-impl Error for ConfigError {
-    fn description(&self) -> &str {
-        use self::ConfigError::*;
-        match *self {
-            UnknownDomain(..) => "unknown domain",
-            Parse(_, ref e) => e.description(),
-            Io(ref e) => e.description(),
-            UnexpectedItem(ref e) => e.description(),
-        }
-    }
-}
+impl Error for ConfigError {}
 
 impl From<io::Error> for ConfigError {
     fn from(src: io::Error) -> ConfigError {
@@ -723,7 +743,7 @@ pub(crate) fn table_from_toml_str(s: &str) -> Result<Table, toml::de::Error> {
 /// (used to store config values internally).
 fn from_toml_value(value: toml::Value) -> Value {
     match value {
-        toml::Value::String(value) => value.to_owned().into(),
+        toml::Value::String(value) => value.into(),
         toml::Value::Float(value) => value.into(),
         toml::Value::Integer(value) => value.into(),
         toml::Value::Boolean(value) => value.into(),
@@ -750,7 +770,7 @@ fn from_toml_value(value: toml::Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syntax::LanguageDefinition;
+    use crate::syntax::LanguageDefinition;
 
     #[test]
     fn test_overrides() {

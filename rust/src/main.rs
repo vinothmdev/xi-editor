@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 #[macro_use]
 extern crate log;
 extern crate chrono;
@@ -108,7 +107,8 @@ fn setup_logging(logging_path: Option<&Path>) -> Result<(), fern::InitError> {
                 record.level(),
                 message,
             ))
-        }).level(level_filter)
+        })
+        .level(level_filter)
         .chain(io::stderr());
 
     if let Some(logging_file_path) = logging_path {
@@ -159,7 +159,7 @@ fn get_flags() -> HashMap<String, Option<String>> {
     let mut args_iterator = std::env::args().peekable();
     while let Some(arg) = args_iterator.next() {
         if arg.starts_with(flag_prefix) {
-            let key = arg.trim_left_matches(flag_prefix).to_string();
+            let key = arg.trim_start_matches(flag_prefix).to_string();
 
             // Check the next argument doesn't start with the flag prefix
             // map_or accounts for peek returning an Option

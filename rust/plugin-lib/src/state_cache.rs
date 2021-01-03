@@ -14,7 +14,6 @@
 
 //! A more sophisticated cache that manages user state.
 
-use bytecount;
 use rand::{thread_rng, Rng};
 
 use xi_rope::interval::IntervalBounds;
@@ -22,7 +21,7 @@ use xi_rope::{LinesMetric, RopeDelta};
 use xi_trace::trace_block;
 
 use super::{Cache, DataSource, Error, View};
-use base_cache::ChunkCache;
+use crate::base_cache::ChunkCache;
 
 const CACHE_SIZE: usize = 1024;
 

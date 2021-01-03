@@ -14,22 +14,21 @@
 
 //! Implementation of Language Server Plugin
 
-use conversion_utils::*;
-use language_server_client::LanguageServerClient;
-use lsp_types::*;
-use result_queue::ResultQueue;
-use serde_json;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
-use types::{Config, LanguageResponseError, LspResponse};
+use std::sync::{Arc, Mutex};
+
 use url::Url;
-use utils::*;
-use xi_core::ConfigTable;
-use xi_core::ViewId;
 use xi_plugin_lib::{ChunkCache, CoreProxy, Plugin, View};
 use xi_rope::rope::RopeDelta;
+
+use crate::conversion_utils::*;
+use crate::language_server_client::LanguageServerClient;
+use crate::lsp_types::*;
+use crate::result_queue::ResultQueue;
+use crate::types::{Config, LanguageResponseError, LspResponse};
+use crate::utils::*;
+use crate::xi_core::{ConfigTable, ViewId};
 
 pub struct ViewInfo {
     version: u64,
@@ -208,7 +207,7 @@ impl LspPlugin {
     ) -> Option<(String, Arc<Mutex<LanguageServerClient>>)> {
         workspace_root
             .clone()
-            .and_then(|r| Some(r.clone().into_string()))
+            .map(|r| r.into_string())
             .or_else(|| {
                 let config = &self.config.language_config[language_id];
                 if config.supports_single_file {
@@ -218,7 +217,8 @@ impl LspPlugin {
                 } else {
                     None
                 }
-            }).and_then(|language_server_identifier| {
+            })
+            .and_then(|language_server_identifier| {
                 let contains =
                     self.language_server_clients.contains_key(&language_server_identifier);
 
@@ -279,11 +279,7 @@ impl LspPlugin {
     where
         F: FnOnce(&mut LanguageServerClient) -> R,
     {
-        let view_info = if let Some(view_info) = self.view_info.get_mut(&view.get_id()) {
-            view_info
-        } else {
-            return None;
-        };
+        let view_info = self.view_info.get_mut(&view.get_id())?;
 
         let ls_client_arc = &self.language_server_clients[&view_info.ls_identifier];
         let mut ls_client = ls_client_arc.lock().unwrap();

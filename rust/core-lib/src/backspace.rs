@@ -13,27 +13,20 @@
 // limitations under the License.
 
 //! Calc start of a backspace delete interval
-
-use view::View;
-
 use xi_rope::{Cursor, Rope};
 
-use config::BufferItems;
-use selection::SelRegion;
+use crate::config::BufferItems;
+use crate::line_offset::{LineOffset, LogicalLines};
+use crate::selection::SelRegion;
 use xi_unicode::*;
 
-#[cfg_attr(feature = "cargo-clippy", allow(cyclomatic_complexity))]
-pub fn offset_for_delete_backwards(
-    view: &View,
-    region: &SelRegion,
-    text: &Rope,
-    config: &BufferItems,
-) -> usize {
+#[allow(clippy::cognitive_complexity)]
+pub fn offset_for_delete_backwards(region: &SelRegion, text: &Rope, config: &BufferItems) -> usize {
     if !region.is_caret() {
         region.min()
     } else {
         // backspace deletes max(1, tab_size) contiguous spaces
-        let (_, c) = view.offset_to_line_col(&text, region.start);
+        let (_, c) = LogicalLines.offset_to_line_col(&text, region.start);
 
         let tab_off = c % config.tab_size;
         let tab_size = config.tab_size;

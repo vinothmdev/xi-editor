@@ -33,7 +33,7 @@ from core: {"id":0,"result": "view-id-1"}
 
 ### client_started
 
-`client_started {"config_dir" "some/path"?, "client_extras_dir":
+`client_started {"config_dir": "some/path"?, "client_extras_dir":
 "some/other/path"?}`
 
 Sent by the client immediately after establishing the core connection. This is
@@ -135,13 +135,6 @@ Copies the active selection, returning their contents or `Null` if the selection
 
 Cut the active selection, returning their contents or `Null` if the selection was empty.
 
-#### cancel_operation
-
-`cancel_operation`
-
-Currently, this collapses selections and multiple cursors, and dehighlights
-searches.
-
 #### scroll
 
 `scroll [0,18]`
@@ -160,39 +153,26 @@ Notifies the backend that the size of the view has changed. This is
 used for word wrapping, if enabled. Width and height are specified
 in px units / points, not display pixels.
 
-#### click
-
-`click [42,31,0,1]`
-
-Implements a mouse click. The array arguments are: line and column
-(0-based, utf-8 code units), modifiers (again, 2 is shift), and
-click count.
-
-#### drag
-
-`drag [42,32,0]`
-
-Implements dragging (extending a selection). Arguments are line,
-column, and flag as in `click`.
-
 #### gesture
 
-`gesture {"line": 42, "col": 31, "ty": "toggle_sel"}`
+`gesture {"line": 42, "col": 31, "ty": {"select": {"granularity": "point", "multi": false}}`
 
-**Note:** both `click` and `drag` functionality will be migrated to
-additional `ty` options for `gesture`.
-
-Currently, the following gestures are supported:
+Gestures correspond to certain pointer events on the text window. Currently, the following gesture types are supported:
 
 ```
-point_select # moves the cursor to a point
-toggle_sel # adds or removes a selection at a point
-range_select # modifies the selection to include a point (shift+click)
-line_select # sets the selection to a given line
-word_select # sets the selection to a given word
-multi_line_select # adds a line to the selection
-multi_word_select # adds a word to the selection
+{"select": {"granularity": "point", "multi": false}}
 ```
+Adds a new selection region, preserving existing regions if `multi` is `true`. Granularity can be one of `"point"`, `"word"`, or `"line"`.
+
+```
+{"select_extend": {"granularity": "point"}}
+```
+Modifies the selection to include a location. This gesture is usually mapped to shift+click on the frontend. Granularity can be one of `"point"`, `"word"`, or `"line"`.
+
+```
+"drag"
+```
+Extends the selection to the mouse's new location. Granularity is determined by the preceding `select` gesture.
 
 #### goto_line
 
@@ -211,7 +191,12 @@ that takes a "movement" enum as a parameter.
 ```
 delete_backward
 delete_forward
+delete_word_forward
+delete_word_backward
+delete_to_end_of_paragraph
+delete_to_beginning_of_line
 insert_newline
+insert_tab
 duplicate_line
 move_up
 move_up_and_modify_selection
@@ -221,6 +206,22 @@ move_left
 move_left_and_modify_selection
 move_right
 move_right_and_modify_selection
+move_word_left
+move_word_left_and_modify_selection
+move_word_right
+move_word_right_and_modify_selection
+move_to_beginning_of_paragraph
+move_to_beginning_of_paragraph_and_modify_selection
+move_to_end_of_paragraph
+move_to_end_of_paragraph_and_modify_selection
+move_to_left_end_of_line
+move_to_left_end_of_line_and_modify_selection
+move_to_right_end_of_line
+move_to_right_end_of_line_and_modify_selection
+move_to_beginning_of_document
+move_to_beginning_of_document_and_modify_selection
+move_to_end_of_document
+move_to_end_of_document_and_modify_selection
 scroll_page_up
 page_up_and_modify_selection
 scroll_page_down
@@ -228,8 +229,11 @@ page_down_and_modify_selection
 yank
 transpose
 select_all
+collapse_selections
 add_selection_above
 add_selection_below
+undo
+redo
 ```
 
 #### Transformations
@@ -370,7 +374,7 @@ valid next occurrence. Supported options for `modify_selection` are:
 * `none`: the selection is not modified
 * `set`: the next/previous match will be set as the new selection
 * `add`: the next/previous match will be added to the current selection
-* `add_remove_current`: the previously added selection will be removed and the next/previous
+* `add_removing_current`: the previously added selection will be removed and the next/previous
 match will be added to the current selection
 
 Selects the next/previous occurrence matching the search query.
@@ -479,8 +483,11 @@ The guarantee on `id` is that it is not currently in use in any lines in the
 view. However, in practice, it will probably just count up. It can also be
 assumed to be small, so using it as an index into a dense array is reasonable.
 
-There are two reserved style IDs, so new style IDs will begin at 2. Style ID 0
-is reserved for selections and ID 1 is reserved for find results.
+**Deprecated:** There are two reserved style IDs, so new style IDs will begin at 2.
+Style ID 0 is reserved for selections and ID 1 is reserved for find results. Reserved
+style IDs will be supported for backward compatibility for a limited time. Instead,
+selections and find matches are now represented as `annotations`.
+
 
 #### scroll_to
 
@@ -499,11 +506,20 @@ update
   ops: Op[]
   view-id: string
   pristine: bool
+  annotations: AnnotationSlice[]
 
 interface Op {
   op: "copy" | "skip" | "invalidate" | "update" | "ins"
   n: number  // number of lines affected
   lines?: Line[]  // only present when op is "update" or "ins"
+  ln?: number // the logical number for this line; null if this line is a soft break
+}
+
+interface AnnotationSlice {
+  type: "find" | "selection" | ...
+  ranges: [[number, number, number, number]]  // start_line, start_col, end_line, end_col
+  payloads: [{}]    // can be any json object or value
+  n: number // number of ranges
 }
 ```
 
@@ -522,7 +538,11 @@ their count; and the editing operations may be more efficiently done in-place
 than by copying from the old state to the new].
 
 The "copy" op appends the `n` lines `[old_ix .. old_ix + n]` to the new lines
-array, and increments `old_ix` by `n`.
+array, and increments `old_ix` by `n`. Additionally, "copy" includes the `ln`
+field; this represents the new logical line number (that is, the 'real' line
+number, ignoring word wrap) of the first line to be copied. **Note:** if the
+first line to be copied is itself a wrapped line, the `ln` number will need to
+be incremented in order to be correct for the first 'real' line.
 
 The "skip" op increments `old_ix` by `n`.
 
@@ -533,9 +553,10 @@ in more detail below. For this op, `n` must equal `lines.length` (alternative:
 make n optional in this case). It does not update `old_ix`.
 
 The "update" op updates the cursor and/or style of n existing lines. As in
-"ins", n must equal lines.length. It also increments `old_ix` by `n`.
-
-**Note:** The "update" op is not currently used by core.
+"ins", n must equal lines.length. It also increments `old_ix` by `n`. If the
+update modifies the line numbers of the given n lines, the `ln` parameter
+representing the new logical line number of the first line (as in the "copy"
+op) should be present.
 
 In all cases, n is guaranteed positive and nonzero (as a consequence, any line
 present in the old state is copied at most once to the new state).
@@ -543,6 +564,7 @@ present in the old state is copied at most once to the new state).
 ```
 interface Line {
   text?: string  // present when op is "update"
+  ln?: number // the logical/'real' line number for this line.
   cursor?: number[]  // utf-8 code point offsets, in increasing order
   styles?: number[]  // length is a multiple of 3, see below
 }
@@ -581,6 +603,11 @@ interface Line {
   styles?: number[]  // length is a multiple of 3, see below
 }
 ```
+
+"annotations" are used to associate some type data with some document regions. For
+example, annotations are used to represent selections and find highlights.
+The [Annotations RFC](https://github.com/xi-editor/xi-editor/blob/master/rfcs/2018-11-23-annotations.md)
+provides a detailed description of the API.
 
 #### measure_width
 
@@ -700,6 +727,18 @@ this writing, the following is valid json for a `Command` object:
         ]
     }
 ```
+
+### update_spans
+
+`update_spans {"start": 0, "len": 20, "spans": [{ "start": 1, "end": 3, "scope_id": 4 }], "rev": 3 }`
+
+Updates existing scope spans starting at offset `start` until offset `len`.
+
+### update_annotations
+
+`update_annotations {"start": 0, "len": 20, "spans": [{ "start": 0, "end": 4, "data": null }], "annotation_type": "find", "rev": 3 }`
+
+Updates existing annotations and adds new annotations starting at offset `start` until offset `len`.
 
 ### Language Support Specific Commands
 

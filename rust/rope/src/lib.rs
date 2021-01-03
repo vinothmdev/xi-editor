@@ -14,26 +14,25 @@
 
 //! Trees for text.
 
-#![cfg_attr(
-    feature = "cargo-clippy",
-    allow(
-        collapsible_if,
-        len_without_is_empty,
-        many_single_char_names,
-        needless_range_loop,
-        new_without_default_derive,
-        should_implement_trait,
-        wrong_self_convention,
-    )
+#![allow(
+    clippy::collapsible_if,
+    clippy::len_without_is_empty,
+    clippy::many_single_char_names,
+    clippy::needless_range_loop,
+    clippy::new_without_default,
+    clippy::should_implement_trait,
+    clippy::wrong_self_convention
 )]
 
 extern crate bytecount;
 extern crate memchr;
 extern crate regex;
-extern crate serde;
 extern crate unicode_segmentation;
+
+#[cfg(feature = "serde")]
 #[macro_use]
-extern crate serde_derive;
+extern crate serde;
+
 #[cfg(test)]
 extern crate serde_json;
 #[cfg(test)]
@@ -48,12 +47,14 @@ pub mod find;
 pub mod interval;
 pub mod multiset;
 pub mod rope;
+#[cfg(feature = "serde")]
+mod serde_impls;
 pub mod spans;
 #[cfg(test)]
 mod test_helpers;
 pub mod tree;
 
-pub use delta::{Builder as DeltaBuilder, Delta, DeltaElement, Transformer};
-pub use interval::Interval;
-pub use rope::{LinesMetric, Rope, RopeDelta, RopeInfo};
-pub use tree::{Cursor, Metric};
+pub use crate::delta::{Builder as DeltaBuilder, Delta, DeltaElement, Transformer};
+pub use crate::interval::Interval;
+pub use crate::rope::{LinesMetric, Rope, RopeDelta, RopeInfo};
+pub use crate::tree::{Cursor, Metric};

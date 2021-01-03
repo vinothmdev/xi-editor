@@ -17,12 +17,13 @@
 use std::cmp;
 
 // These two imports are for the `apply` method only.
-use interval::Interval;
+use crate::interval::Interval;
+use crate::tree::{Node, NodeInfo, TreeBuilder};
 use std::fmt;
 use std::slice;
-use tree::{Node, NodeInfo, TreeBuilder};
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 struct Segment {
     len: usize,
     count: usize,
@@ -34,7 +35,8 @@ struct Segment {
 /// included in the set.
 ///
 /// Internally, this is stored as a list of "segments" with a length and a count.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Subset {
     /// Invariant, maintained by `SubsetBuilder`: all `Segment`s have non-zero
     /// length, and no `Segment` has the same count as the one before it.
@@ -356,7 +358,7 @@ impl fmt::Debug for Subset {
                     '+'
                 };
                 for _ in 0..s.len {
-                    try!(write!(f, "{}", chr));
+                    write!(f, "{}", chr)?;
                 }
             }
             Ok(())
@@ -422,20 +424,24 @@ impl<'a> Iterator for ZipIter<'a> {
                 Some(&Segment { len: a_len, count: a_count }),
                 Some(&Segment { len: b_len, count: b_count }),
             ) => {
-                let len = if a_len + self.a_consumed == b_len + self.b_consumed {
-                    self.a_consumed += a_len;
-                    self.a_i += 1;
-                    self.b_consumed += b_len;
-                    self.b_i += 1;
-                    self.a_consumed - self.consumed
-                } else if a_len + self.a_consumed < b_len + self.b_consumed {
-                    self.a_consumed += a_len;
-                    self.a_i += 1;
-                    self.a_consumed - self.consumed
-                } else {
-                    self.b_consumed += b_len;
-                    self.b_i += 1;
-                    self.b_consumed - self.consumed
+                let len = match (a_len + self.a_consumed).cmp(&(b_len + self.b_consumed)) {
+                    cmp::Ordering::Equal => {
+                        self.a_consumed += a_len;
+                        self.a_i += 1;
+                        self.b_consumed += b_len;
+                        self.b_i += 1;
+                        self.a_consumed - self.consumed
+                    }
+                    cmp::Ordering::Less => {
+                        self.a_consumed += a_len;
+                        self.a_i += 1;
+                        self.a_consumed - self.consumed
+                    }
+                    cmp::Ordering::Greater => {
+                        self.b_consumed += b_len;
+                        self.b_i += 1;
+                        self.b_consumed - self.consumed
+                    }
                 };
                 self.consumed += len;
                 Some(ZipSegment { len, a_count, b_count })
@@ -503,8 +509,8 @@ impl<'a> Mapper<'a> {
 
 #[cfg(test)]
 mod tests {
-    use multiset::*;
-    use test_helpers::find_deletions;
+    use crate::multiset::*;
+    use crate::test_helpers::find_deletions;
 
     const TEST_STR: &'static str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 

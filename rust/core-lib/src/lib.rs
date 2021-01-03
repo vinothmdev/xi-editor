@@ -14,25 +14,21 @@
 
 //! The main library for xi-core.
 
-#![cfg_attr(
-    feature = "cargo-clippy",
-    allow(
-        boxed_local,
-        cast_lossless,
-        collapsible_if,
-        let_and_return,
-        map_entry,
-        match_as_ref,
-        match_bool,
-        needless_pass_by_value,
-        new_without_default,
-        new_without_default_derive,
-        or_fun_call,
-        ptr_arg,
-        too_many_arguments,
-        unreadable_literal,
-        get_unwrap,
-    )
+#![allow(
+    clippy::boxed_local,
+    clippy::cast_lossless,
+    clippy::collapsible_if,
+    clippy::let_and_return,
+    clippy::map_entry,
+    clippy::match_as_ref,
+    clippy::match_bool,
+    clippy::needless_pass_by_value,
+    clippy::new_without_default,
+    clippy::or_fun_call,
+    clippy::ptr_arg,
+    clippy::too_many_arguments,
+    clippy::unreadable_literal,
+    clippy::get_unwrap
 )]
 
 #[macro_use]
@@ -53,7 +49,6 @@ extern crate toml;
 extern crate xi_rope;
 extern crate xi_rpc;
 extern crate xi_trace;
-extern crate xi_trace_dump;
 extern crate xi_unicode;
 
 #[cfg(feature = "ledger")]
@@ -69,10 +64,12 @@ mod ledger_includes {
 #[cfg(feature = "ledger")]
 use ledger_includes::*;
 
+pub mod annotations;
 pub mod backspace;
 pub mod client;
 pub mod config;
 pub mod core;
+pub mod edit_ops;
 pub mod edit_types;
 pub mod editor;
 pub mod event_context;
@@ -84,6 +81,7 @@ pub mod index_set;
 pub mod layers;
 pub mod line_cache_shadow;
 pub mod line_ending;
+pub mod line_offset;
 pub mod linewrap;
 pub mod movement;
 pub mod plugins;
@@ -104,12 +102,12 @@ pub mod rpc;
 #[cfg(feature = "ledger")]
 use apps_ledger_services_public::Ledger_Proxy;
 
-pub use config::{BufferItems as BufferConfig, Table as ConfigTable};
-pub use core::{WeakXiCore, XiCore};
-pub use editor::EditType;
-pub use plugins::manifest as plugin_manifest;
-pub use plugins::rpc as plugin_rpc;
-pub use plugins::PluginPid;
-pub use syntax::{LanguageDefinition, LanguageId};
-pub use tabs::test_helpers;
-pub use tabs::{BufferId, BufferIdentifier, ViewId};
+pub use crate::config::{BufferItems as BufferConfig, Table as ConfigTable};
+pub use crate::core::{WeakXiCore, XiCore};
+pub use crate::editor::EditType;
+pub use crate::plugins::manifest as plugin_manifest;
+pub use crate::plugins::rpc as plugin_rpc;
+pub use crate::plugins::PluginPid;
+pub use crate::syntax::{LanguageDefinition, LanguageId};
+pub use crate::tabs::test_helpers;
+pub use crate::tabs::{BufferId, BufferIdentifier, ViewId};

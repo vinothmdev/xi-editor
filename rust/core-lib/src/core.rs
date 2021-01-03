@@ -18,12 +18,11 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use serde_json::Value;
 
 use xi_rpc::{Error as RpcError, Handler, ReadError, RemoteError, RpcCtx};
-use xi_trace;
 
-use plugin_rpc::{PluginCommand, PluginNotification, PluginRequest};
-use plugins::{Plugin, PluginId};
-use rpc::*;
-use tabs::{CoreState, ViewId};
+use crate::plugin_rpc::{PluginCommand, PluginNotification, PluginRequest};
+use crate::plugins::{Plugin, PluginId};
+use crate::rpc::*;
+use crate::tabs::{CoreState, ViewId};
 
 /// A reference to the main core state.
 ///
@@ -51,10 +50,7 @@ impl XiCore {
 
     /// Returns `true` if the `client_started` has not been received.
     fn is_waiting(&self) -> bool {
-        match *self {
-            XiCore::Waiting => true,
-            _ => false,
-        }
+        matches!(*self, XiCore::Waiting)
     }
 
     /// Returns a guard to the core state. A convenience around `Mutex::lock`.

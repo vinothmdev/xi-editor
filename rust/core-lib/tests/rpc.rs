@@ -59,8 +59,8 @@ fn test_state() {
     let write = io::sink();
     let json = make_reader(
         r#"{"method":"client_started","params":{}}
-{"method":"set_theme","params":{"theme_name":"InspiredGitHub"}}
-{"id":0,"method":"new_view","params":{}}"#,
+{"id":0,"method":"new_view","params":{"file_path":"../Cargo.toml"}}
+{"method":"set_theme","params":{"theme_name":"InspiredGitHub"}}"#,
     );
     let mut rpc_looper = RpcLoop::new(write);
     rpc_looper.mainloop(|| json, &mut state).unwrap();
@@ -90,6 +90,97 @@ fn test_state() {
         let state = state.inner();
         assert_eq!(state._test_open_editors().len(), 3);
     }
+}
+
+/// Test whether xi-core invalidates cache lines upon a cursor motion.
+#[test]
+fn test_invalidate() {
+    let mut state = XiCore::new();
+    let (tx, mut rx) = test_channel();
+    let mut rpc_looper = RpcLoop::new(tx);
+    let json = make_reader(
+        r#"{"method":"client_started","params":{}}
+{"id":0,"method":"new_view","params":{}}
+"#,
+    );
+    assert!(rpc_looper.mainloop(|| json, &mut state).is_ok());
+
+    let mut edit_cmds = String::new();
+
+    for i in 1..20 {
+        // add lines "line 1", "line 2",...
+        edit_cmds.push_str(r#"{"method":"edit","params":{"view_id":"view-id-1","method":"insert","params":{"chars":"line "#);
+        edit_cmds.push_str(&i.to_string());
+        edit_cmds.push_str(
+            r#""}}}
+{"method":"edit","params":{"view_id":"view-id-1","method":"insert_newline","params":[]}}
+"#,
+        );
+    }
+
+    let json = make_reader(edit_cmds);
+    assert!(rpc_looper.mainloop(|| json, &mut state).is_ok());
+
+    // jump to line 1, then jump to line 18
+    const MOVEMENTS: &str = r#"{"method":"edit","params":{"view_id":"view-id-1","method":"goto_line","params":{"line":1}}}
+{"method":"edit","params":{"view_id":"view-id-1","method":"goto_line","params":{"line":18}}}"#;
+
+    let json = make_reader(MOVEMENTS);
+    assert!(rpc_looper.mainloop(|| json, &mut state).is_ok());
+
+    let mut last_ops = Vec::new();
+
+    while let Some(Ok(resp)) = rx.next_timeout(std::time::Duration::from_millis(1000)) {
+        if !resp.is_response() && resp.get_method().unwrap() == "update" {
+            let ops = resp.0.as_object().unwrap()["params"].as_object().unwrap()["update"]
+                .as_object()
+                .unwrap()["ops"]
+                .as_array()
+                .unwrap();
+            last_ops = ops.clone();
+
+            // Verify that the "invalidate" ops can only go first or last.
+            if ops.len() > 2 {
+                debug_assert!(
+                    ops.iter()
+                        // step over leading "invalidate" and "skip"
+                        .skip_while(|op| op["op"].as_str().unwrap() == "invalidate"
+                            || op["op"].as_str().unwrap() == "skip")
+                        // current op (ins/copy/update) adds lines;
+                        // wait for another invalidate/skip
+                        .skip_while(|op| op["op"].as_str().unwrap() != "invalidate")
+                        // step over trailing "invalidate" and "skip"
+                        .skip_while(|op| op["op"].as_str().unwrap() == "invalidate"
+                            || op["op"].as_str().unwrap() == "skip")
+                        .next()
+                        .is_none(),
+                    "bad update: ".to_string()
+                        + &ops
+                            .iter()
+                            .map(|op| format!(
+                                "{} {}",
+                                op["op"].as_str().unwrap(),
+                                op["n"].as_u64().unwrap()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                );
+            }
+        }
+    }
+
+    // Dump the last vector of ops.
+    // Verify that there is an "update" op in case of a cursor motion.
+    assert_eq!(
+        last_ops
+            .iter()
+            .map(|op| {
+                let op_in = op.as_object().unwrap();
+                (op_in["op"].as_str().unwrap(), op_in["n"].as_u64().unwrap())
+            })
+            .collect::<Vec<_>>(),
+        [("copy", 1), ("update", 1), ("copy", 5), ("copy", 11), ("update", 2)]
+    );
 }
 
 #[test]
@@ -200,13 +291,17 @@ fn test_settings_commands() {
     let resp = rx.expect_response().unwrap();
     assert_eq!(resp["tab_size"], json!(4));
 
-    let json = make_reader(r#"{"method":"modify_user_config","params":{"domain":{"user_override":"view-id-1"},"changes":{"font_face": "Comic Sans"}}}
+    let json = make_reader(
+        r#"{"method":"modify_user_config","params":{"domain":{"user_override":"view-id-1"},"changes":{"font_face": "Comic Sans"}}}
 {"method":"modify_user_config","params":{"domain":{"syntax":"rust"},"changes":{"font_size":42}}}
-{"method":"modify_user_config","params":{"domain":"general","changes":{"tab_size":13,"font_face":"Papyrus"}}}"#);
+{"method":"modify_user_config","params":{"domain":"general","changes":{"tab_size":13,"font_face":"Papyrus"}}}"#,
+    );
     rpc_looper.mainloop(|| json, &mut state).unwrap();
     // discard config_changed
     rx.expect_rpc("config_changed");
+    rx.expect_rpc("update");
     rx.expect_rpc("config_changed");
+    rx.expect_rpc("update");
 
     let json = make_reader(r#"{"method":"get_config","id":2,"params":{"view_id":"view-id-1"}}"#);
     rpc_looper.mainloop(|| json, &mut state).unwrap();
@@ -215,7 +310,9 @@ fn test_settings_commands() {
     assert_eq!(resp["font_face"], json!("Comic Sans"));
 
     // null value should clear entry from this config
-    let json = make_reader(r#"{"method":"modify_user_config","params":{"domain":{"user_override":"view-id-1"},"changes":{"font_face": null}}}"#);
+    let json = make_reader(
+        r#"{"method":"modify_user_config","params":{"domain":{"user_override":"view-id-1"},"changes":{"font_face": null}}}"#,
+    );
     rpc_looper.mainloop(|| json, &mut state).unwrap();
     let resp = rx.expect_rpc("config_changed");
     assert_eq!(resp.0["params"]["changes"]["font_face"], json!("Papyrus"));
@@ -254,10 +351,10 @@ const MOVEMENT_RPCS: &str = r#"{"method":"edit","params":{"view_id":"view-id-1",
 {"method":"edit","params":{"view_id":"view-id-1","method":"page_down_and_modify_selection","params":[]}}
 {"method":"edit","params":{"view_id":"view-id-1","method":"select_all","params":[]}}
 {"method":"edit","params":{"view_id":"view-id-1","method":"add_selection_above","params":[]}}
-{"method":"edit","params":{"view_id":"view-id-1","method":"add_selection_below","params":[]}}"#;
+{"method":"edit","params":{"view_id":"view-id-1","method":"add_selection_below","params":[]}}
+{"method":"edit","params":{"view_id":"view-id-1","method":"collapse_selections","params":[]}}"#;
 
-const TEXT_EDIT_RPCS: &str =
-    r#"{"method":"edit","params":{"view_id":"view-id-1","method":"insert","params":{"chars":"a"}}}
+const TEXT_EDIT_RPCS: &str = r#"{"method":"edit","params":{"view_id":"view-id-1","method":"insert","params":{"chars":"a"}}}
 {"method":"edit","params":{"view_id":"view-id-1","method":"delete_backward","params":[]}}
 {"method":"edit","params":{"view_id":"view-id-1","method":"delete_forward","params":[]}}
 {"method":"edit","params":{"view_id":"view-id-1","method":"delete_word_forward","params":[]}}

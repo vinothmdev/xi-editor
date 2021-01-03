@@ -18,8 +18,11 @@ use std::cmp::{max, min};
 use std::fmt;
 use std::ops::Deref;
 
-use index_set::remove_n_at;
-use xi_rope::{Interval, RopeDelta, Transformer};
+use crate::annotations::{AnnotationRange, AnnotationSlice, AnnotationType, ToAnnotation};
+use crate::index_set::remove_n_at;
+use crate::line_offset::LineOffset;
+use crate::view::View;
+use xi_rope::{Interval, Rope, RopeDelta, Transformer};
 
 /// A type representing horizontal measurements. This is currently in units
 /// that are not very well defined except that ASCII characters count as
@@ -100,7 +103,7 @@ impl Selection {
         let mut end_ix = ix;
         if self.regions[ix].min() <= region.min() {
             if self.regions[ix].should_merge(region) {
-                region = self.regions[ix].merge_with(region);
+                region = region.merge_with(self.regions[ix]);
             } else {
                 ix += 1;
             }
@@ -215,10 +218,28 @@ impl Selection {
             let new_region = SelRegion::new(
                 transformer.transform(region.start, start_after),
                 transformer.transform(region.end, end_after),
-            ).with_affinity(region.affinity);
+            )
+            .with_affinity(region.affinity);
             result.add_region(new_region);
         }
         result
+    }
+}
+
+/// Implementing the `ToAnnotation` trait allows to convert selections to annotations.
+impl ToAnnotation for Selection {
+    fn get_annotations(&self, interval: Interval, view: &View, text: &Rope) -> AnnotationSlice {
+        let regions = self.regions_in_range(interval.start(), interval.end());
+        let ranges = regions
+            .iter()
+            .map(|region| {
+                let (start_line, start_col) = view.offset_to_line_col(text, region.min());
+                let (end_line, end_col) = view.offset_to_line_col(text, region.max());
+
+                AnnotationRange { start_line, start_col, end_line, end_col }
+            })
+            .collect::<Vec<AnnotationRange>>();
+        AnnotationSlice::new(AnnotationType::Selection, ranges, None)
     }
 }
 
@@ -322,8 +343,10 @@ impl SelRegion {
             || ((self.is_caret() || other.is_caret()) && other.min() == self.max())
     }
 
+    // Merge self with an overlapping region.
+    // Retains direction of self.
     fn merge_with(self, other: SelRegion) -> SelRegion {
-        let is_forward = self.end > self.start || other.end > other.start;
+        let is_forward = self.end >= self.start;
         let new_min = min(self.min(), other.min());
         let new_max = max(self.max(), other.max());
         let (start, end) = if is_forward { (new_min, new_max) } else { (new_max, new_min) };
@@ -336,6 +359,12 @@ impl SelRegion {
 impl<'a> From<&'a SelRegion> for Interval {
     fn from(src: &'a SelRegion) -> Interval {
         Interval::new(src.min(), src.max())
+    }
+}
+
+impl From<Interval> for SelRegion {
+    fn from(src: Interval) -> SelRegion {
+        SelRegion::new(src.start, src.end)
     }
 }
 
@@ -468,6 +497,8 @@ mod tests {
         assert_eq!(s.deref(), &[r(1, 3), r(3, 6), r(7, 9)]);
         s.add_region(r(2, 8));
         assert_eq!(s.deref(), &[r(1, 9)]);
+        s.add_region(r(10, 8));
+        assert_eq!(s.deref(), &[r(10, 1)]);
 
         s.clear();
         assert_eq!(s.deref(), &[]);

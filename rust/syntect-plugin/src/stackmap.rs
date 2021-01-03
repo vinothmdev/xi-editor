@@ -17,7 +17,6 @@
 //!
 //! For discussion of this approach, see [this
 //! issue](https://github.com/google/xi-editor/issues/284).
-
 use std::collections::HashMap;
 
 use syntect::parsing::Scope;
@@ -91,10 +90,7 @@ impl StackMap {
 
 impl LookupResult {
     pub fn is_new(&self) -> bool {
-        match *self {
-            LookupResult::New(_) => true,
-            _ => false,
-        }
+        matches!(*self, LookupResult::New(_))
     }
 }
 

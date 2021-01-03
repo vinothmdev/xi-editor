@@ -18,11 +18,12 @@
 //! This simplifies code elsewhere, and makes it easier to route events to
 //! the editor or view as appropriate.
 
-use movement::Movement;
-use rpc::{
-    EditNotification, FindQuery, GestureType, LineRange, MouseAction, Position, SelectionModifier,
+use crate::movement::Movement;
+use crate::rpc::{
+    EditNotification, FindQuery, GestureType, LineRange, MouseAction, Position,
+    SelectionGranularity, SelectionModifier,
 };
-use view::Size;
+use crate::view::Size;
 
 /// Events that only modify view state
 #[derive(Debug, PartialEq, Clone)]
@@ -42,12 +43,12 @@ pub(crate) enum ViewEvent {
     FindNext { wrap_around: bool, allow_same: bool, modify_selection: SelectionModifier },
     FindPrevious { wrap_around: bool, allow_same: bool, modify_selection: SelectionModifier },
     FindAll,
-    Cancel,
     HighlightFind { visible: bool },
     SelectionForFind { case_sensitive: bool },
     Replace { chars: String, preserve_case: bool },
     SelectionForReplace,
     SelectionIntoLines,
+    CollapseSelections,
 }
 
 /// Events that modify the buffer
@@ -84,6 +85,8 @@ pub(crate) enum SpecialEvent {
     Resize(Size),
     RequestLines(LineRange),
     RequestHover { request_id: usize, position: Option<Position> },
+    DebugToggleComment,
+    Reindent,
     ToggleRecording(Option<String>),
     PlayRecording(String),
     ClearRecording(String),
@@ -114,7 +117,7 @@ impl From<SpecialEvent> for EventDomain {
     }
 }
 
-#[cfg_attr(rustfmt, rustfmt_skip)]
+#[rustfmt::skip]
 impl From<EditNotification> for EventDomain {
     fn from(src: EditNotification) -> EventDomain {
         use self::EditNotification::*;
@@ -221,8 +224,41 @@ impl From<EditNotification> for EventDomain {
             Transpose => BufferEvent::Transpose.into(),
             Click(action) => ViewEvent::Click(action).into(),
             Drag(action) => ViewEvent::Drag(action).into(),
-            Gesture { line, col,  ty } =>
-                ViewEvent::Gesture { line, col, ty }.into(),
+            Gesture { line, col,  ty } => {
+                // Translate deprecated gesture types into the new format
+                let new_ty = match ty {
+                    GestureType::PointSelect => {
+                        warn!("The point_select gesture is deprecated; use select instead");
+                        GestureType::Select {granularity: SelectionGranularity::Point, multi: false}
+                    }
+                    GestureType::ToggleSel => {
+                        warn!("The toggle_sel gesture is deprecated; use select instead");
+                        GestureType::Select { granularity: SelectionGranularity::Point, multi: true}
+                    }
+                    GestureType::WordSelect => {
+                        warn!("The word_select gesture is deprecated; use select instead");
+                        GestureType::Select { granularity: SelectionGranularity::Word, multi: false}
+                    }
+                    GestureType::MultiWordSelect => {
+                        warn!("The multi_word_select gesture is deprecated; use select instead");
+                        GestureType::Select { granularity: SelectionGranularity::Word, multi: true}
+                    }
+                    GestureType::LineSelect => {
+                        warn!("The line_select gesture is deprecated; use select instead");
+                        GestureType::Select { granularity: SelectionGranularity::Line, multi: false}
+                    }
+                    GestureType::MultiLineSelect => {
+                        warn!("The multi_line_select gesture is deprecated; use select instead");
+                        GestureType::Select { granularity: SelectionGranularity::Line, multi: true}
+                    }
+                    GestureType::RangeSelect => {
+                        warn!("The range_select gesture is deprecated; use select_extend instead");
+                        GestureType::SelectExtend { granularity: SelectionGranularity::Point }
+                    }
+                    _ => ty
+                };
+                ViewEvent::Gesture { line, col, ty: new_ty }.into()
+            },
             Undo => BufferEvent::Undo.into(),
             Redo => BufferEvent::Redo.into(),
             Find { chars, case_sensitive, regex, whole_words } =>
@@ -237,12 +273,13 @@ impl From<EditNotification> for EventDomain {
             DebugRewrap => SpecialEvent::DebugRewrap.into(),
             DebugWrapWidth => SpecialEvent::DebugWrapWidth.into(),
             DebugPrintSpans => SpecialEvent::DebugPrintSpans.into(),
-            CancelOperation => ViewEvent::Cancel.into(),
             Uppercase => BufferEvent::Uppercase.into(),
             Lowercase => BufferEvent::Lowercase.into(),
             Capitalize => BufferEvent::Capitalize.into(),
             Indent => BufferEvent::Indent.into(),
             Outdent => BufferEvent::Outdent.into(),
+            Reindent => SpecialEvent::Reindent.into(),
+            DebugToggleComment => SpecialEvent::DebugToggleComment.into(),
             HighlightFind { visible } => ViewEvent::HighlightFind { visible }.into(),
             SelectionForFind { case_sensitive } =>
                 ViewEvent::SelectionForFind { case_sensitive }.into(),
@@ -260,6 +297,7 @@ impl From<EditNotification> for EventDomain {
             ToggleRecording { recording_name } => SpecialEvent::ToggleRecording(recording_name).into(),
             PlayRecording { recording_name } => SpecialEvent::PlayRecording(recording_name).into(),
             ClearRecording { recording_name } => SpecialEvent::ClearRecording(recording_name).into(),
+            CollapseSelections => ViewEvent::CollapseSelections.into(),
         }
     }
 }

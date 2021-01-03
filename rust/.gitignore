@@ -4,3 +4,7 @@
 *.rs.bk
 target
 build
+
+# Editor configs
+.idea/
+.vscode/

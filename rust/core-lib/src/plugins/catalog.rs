@@ -20,11 +20,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use toml;
-
 use super::{PluginDescription, PluginName};
-use config::table_from_toml_str;
-use syntax::Languages;
+use crate::config::table_from_toml_str;
+use crate::syntax::Languages;
 
 /// A catalog of all available plugins.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +46,11 @@ impl<'a> PluginCatalog {
     pub fn reload_from_paths(&mut self, paths: &[PathBuf]) {
         self.items.clear();
         self.locations.clear();
+        self.load_from_paths(paths);
+    }
+
+    /// Loads plugins from paths and adds them to existing plugins.
+    pub fn load_from_paths(&mut self, paths: &[PathBuf]) {
         let all_manifests = find_all_manifests(paths);
         for manifest_path in &all_manifests {
             match load_manifest(manifest_path) {
@@ -79,9 +82,22 @@ impl<'a> PluginCatalog {
         self.items.keys()
     }
 
+    /// Returns the plugin located at the provided file path.
+    pub fn get_from_path(&self, path: &PathBuf) -> Option<Arc<PluginDescription>> {
+        self.items
+            .values()
+            .find(|&v| v.exec_path.to_str().unwrap().contains(path.to_str().unwrap()))
+            .cloned()
+    }
+
     /// Returns a reference to the named plugin if it exists in the catalog.
     pub fn get_named(&self, plugin_name: &str) -> Option<Arc<PluginDescription>> {
         self.items.get(plugin_name).map(Arc::clone)
+    }
+
+    /// Removes the named plugin.
+    pub fn remove_named(&mut self, plugin_name: &str) {
+        self.items.remove(plugin_name);
     }
 }
 
@@ -98,7 +114,7 @@ fn find_all_manifests(paths: &[PathBuf]) -> Vec<PathBuf> {
             dir.flat_map(|item| item.map(|p| p.path()).ok())
                 .map(|dir| dir.join("manifest.toml"))
                 .filter(|f| f.exists())
-                .for_each(|f| manifest_paths.push(f.to_owned()))
+                .for_each(|f| manifest_paths.push(f))
         });
         if let Err(e) = result {
             error!("error reading plugin path {:?}, {:?}", path, e);
